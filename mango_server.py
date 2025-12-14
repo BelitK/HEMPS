@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field
 from mango import Agent, create_topology, activate, create_tcp_container
 
 
+# -------------------------
+# Mango Agent
+# -------------------------
 class DynamicAgent(Agent):
     def __init__(self, name: str, persona: str):
         super().__init__()
@@ -17,6 +20,9 @@ class DynamicAgent(Agent):
         print(f"[{self.name}] {content}")
 
 
+# -------------------------
+# Registry to export topology for the LLM
+# -------------------------
 class TopologyRegistry:
     def __init__(self):
         self.nodes: Dict[str, Dict[str, Any]] = {}
@@ -52,6 +58,9 @@ def unique_name(base: str, existing: set[str]) -> str:
     return f"{base}_{i}"
 
 
+# -------------------------
+# API Schemas
+# -------------------------
 class CreateAgentRequest(BaseModel):
     name: str = Field(..., description="Unique agent name")
     persona: str = Field(..., description="1-2 sentence role description")
@@ -65,6 +74,20 @@ class CreateAgentResponse(BaseModel):
     connected_to: List[str]
 
 
+class AddEdgeRequest(BaseModel):
+    src: str = Field(..., description="Existing agent name (source)")
+    dst: str = Field(..., description="Existing agent name (destination)")
+    bidirectional: bool = Field(default=False, description="If true, add edges both ways")
+
+
+class AddEdgeResponse(BaseModel):
+    added: bool
+    edges: List[Dict[str, str]]
+
+
+# -------------------------
+# FastAPI App + Mango Runtime State
+# -------------------------
 app = FastAPI(title="Mango Runtime Server")
 
 registry = TopologyRegistry()
@@ -80,23 +103,22 @@ activation_manager = None
 async def startup():
     global container, topology_ctx, topology, activation_manager
 
-    # Avoid bind conflicts
+    # Avoid bind conflicts by letting OS pick a free port for Mango TCP container
     container = create_tcp_container(("127.0.0.1", 0))
 
-    # Topology created once
     topology_ctx = create_topology()
     topology = topology_ctx.__enter__()
 
-    # Register agents BEFORE activation (matches docs/examples)
+    # Seed agent(s)
     router = DynamicAgent("router", "Routes messages and acts as the central hub.")
     router_id = topology.add_node(router)
     registry.add_node("router", router_id, router.persona)
     agents_by_name["router"] = router
 
+    # Register before activation
     container.register(router)
 
-    # Activate ONCE and keep it active for server lifetime.
-    # IMPORTANT: do NOT call container.start() here; activate starts containers first. :contentReference[oaicite:3]{index=3}
+    # Activate once for server lifetime (no container.start() call)
     activation_manager = activate(container)
     await activation_manager.__aenter__()
 
@@ -146,7 +168,39 @@ async def create_agent(req: CreateAgentRequest):
     if hasattr(topology, "inject"):
         topology.inject()
 
-    # Container is already active; registering is enough.
+    # Container is active; registering is enough
     container.register(agent)
 
     return CreateAgentResponse(created=True, name=name, node_id=node_id, connected_to=connect_to)
+
+
+@app.post("/edges", response_model=AddEdgeResponse)
+async def add_edge(req: AddEdgeRequest):
+    src = normalize_name(req.src)
+    dst = normalize_name(req.dst)
+
+    if src not in agents_by_name:
+        raise HTTPException(status_code=400, detail=f"unknown src agent: {src}")
+    if dst not in agents_by_name:
+        raise HTTPException(status_code=400, detail=f"unknown dst agent: {dst}")
+
+    src_id = registry.nodes[src]["id"]
+    dst_id = registry.nodes[dst]["id"]
+
+    added_edges: List[Dict[str, str]] = []
+
+    # Add src -> dst
+    topology.add_edge(src_id, dst_id)
+    registry.add_edge(src, dst)
+    added_edges.append({"from": src, "to": dst})
+
+    # Optional reverse edge
+    if req.bidirectional and src != dst:
+        topology.add_edge(dst_id, src_id)
+        registry.add_edge(dst, src)
+        added_edges.append({"from": dst, "to": src})
+
+    if hasattr(topology, "inject"):
+        topology.inject()
+
+    return AddEdgeResponse(added=True, edges=added_edges)
