@@ -6,17 +6,18 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'Agent_controller'))
 
 def test_imports():
     try:
-        from Agent_controller.Common.llm_interface import LLMInterface
-        print("Success: LLMInterface imported.")
-        
         from Agent_controller.Deliberate.io_agent import IOAgent
         print("Success: IOAgent imported.")
         
         # Test Instantiation
-        llm = LLMInterface()
-        serialized = llm.serialize_state({"test": 123})
-        print(f"Serialization test: {serialized}")
+        agent = IOAgent(dispatch_agent_addr="test_addr")
+        print(f"Instantiation test: {agent.system_context}")
         
+        # Test Validation
+        is_safe = agent.validate_input("Hello")
+        is_unsafe = agent.validate_input("Infinite power")
+        print(f"Validation test: Safe={is_safe}, Unsafe={not is_unsafe}")
+
         print("Verification Complete.")
     except Exception as e:
         print(f"Verification Failed: {e}")
