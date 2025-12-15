@@ -49,10 +49,10 @@ class IOAgent(mango.Agent):
             self.schedule_instant_message(UserResponse(f"Acknowledged. Processing: '{request.message}'"), sender)
 
         elif request.type == RequestType.EXPLAIN:
-            # For explanation, we return the data context. 
+            # I return the data context. 
             # The actual NL generation happens at the higher-level controller/binding.
             
-            # We bundle the state that clarifies WHY decisions were made.
+            # Bundles the state that clarifies WHY decisions were made.
             explanation_data = f"Context: {self.system_context}"
             self.schedule_instant_message(UserResponse(explanation_data), sender)
 
