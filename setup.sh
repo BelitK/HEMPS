@@ -27,3 +27,5 @@ else
 fi
 
 echo "✅ Setup complete. Run your project with: python main.py"
+
+## TODO: Add ollama installer
