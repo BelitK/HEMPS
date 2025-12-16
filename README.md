@@ -4,10 +4,15 @@ The project description and a brief template documentation can be found in PROJE
 
 ## Installing
 ```bash
-pip install -r requirements.txt
+bash install.sh
 ```
 
 ## Run the template 
 ```bash
-python src/main.py
+bash run.sh
+
+```
+in another terminal
+``` 
+uv run python_script.py
 ```
