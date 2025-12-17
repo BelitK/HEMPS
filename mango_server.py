@@ -1,10 +1,45 @@
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal, Tuple
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, constr
 
 from mango import Agent, create_topology, activate, create_tcp_container
+
+# Try importing Mango State enum for link activation
+try:
+    from mango.agent.core import State  # development branch path
+except Exception:
+    State = None  # Fallback: we will still track state in registry
+
+
+# -------------------------
+# Guards
+# -------------------------
+AgentName = constr(pattern=r"^[a-z][a-z0-9_]{0,31}$")
+
+FORBIDDEN_NAME_PARTS = [
+    "create_agent",
+    "connect_agent",
+    "set_agent",
+    "repeat_step",
+    "step_",
+    "plan",
+    "task",
+    "do_",
+]
+
+
+def reject_bad_name(name: str) -> None:
+    lowered = name.lower()
+    for bad in FORBIDDEN_NAME_PARTS:
+        if bad in lowered:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid agent name '{name}'. Use a domain noun like house_battery, pv_panels, ev_charger."
+                ),
+            )
 
 
 # -------------------------
@@ -21,12 +56,14 @@ class DynamicAgent(Agent):
 
 
 # -------------------------
-# Registry to export topology for the LLM
+# Registry to export topology
 # -------------------------
 class TopologyRegistry:
     def __init__(self):
         self.nodes: Dict[str, Dict[str, Any]] = {}
-        self.edges: List[Dict[str, str]] = []
+        # edges store state: NORMAL | INACTIVE | BROKEN
+        self.edges: List[Dict[str, Any]] = []
+        self._edge_index: Dict[Tuple[str, str], int] = {}
 
     def export(self) -> Dict[str, Any]:
         return {"nodes": list(self.nodes.values()), "edges": list(self.edges)}
@@ -34,19 +71,29 @@ class TopologyRegistry:
     def add_node(self, name: str, node_id: int, persona: str):
         self.nodes[name] = {"id": node_id, "name": name, "persona": persona}
 
-    def add_edge(self, src: str, dst: str):
-        self.edges.append({"from": src, "to": dst})
+    def upsert_edge(self, src: str, dst: str, state: str = "NORMAL") -> bool:
+        """
+        Insert edge if missing, otherwise update its state.
+        Returns True if state changed or edge inserted.
+        """
+        key = (src, dst)
+        if key in self._edge_index:
+            idx = self._edge_index[key]
+            old_state = self.edges[idx].get("state", "NORMAL")
+            if old_state != state:
+                self.edges[idx]["state"] = state
+                return True
+            return False
 
+        self._edge_index[key] = len(self.edges)
+        self.edges.append({"from": src, "to": dst, "state": state})
+        return True
 
-def normalize_name(raw: str) -> str:
-    raw = raw.strip().lower()
-    raw = re.sub(r"[^a-z0-9_]+", "_", raw)
-    raw = re.sub(r"_+", "_", raw).strip("_")
-    if not raw:
-        raw = "agent"
-    if not raw[0].isalpha():
-        raw = f"a_{raw}"
-    return raw
+    def get_edge_state(self, src: str, dst: str) -> Optional[str]:
+        key = (src, dst)
+        if key not in self._edge_index:
+            return None
+        return self.edges[self._edge_index[key]].get("state", "NORMAL")
 
 
 def unique_name(base: str, existing: set[str]) -> str:
@@ -62,9 +109,10 @@ def unique_name(base: str, existing: set[str]) -> str:
 # API Schemas
 # -------------------------
 class CreateAgentRequest(BaseModel):
-    name: str = Field(..., description="Unique agent name")
-    persona: str = Field(..., description="1-2 sentence role description")
-    connect_to: Optional[List[str]] = Field(default=None, description="Existing agent names to connect to")
+    model_config = ConfigDict(extra="forbid")
+    name: AgentName = Field(..., description="Unique agent name (snake_case)")
+    persona: str = Field(..., min_length=10, max_length=240, description="1-2 sentence role description")
+    connect_to: Optional[List[AgentName]] = Field(default=None, description="Existing agent names to connect to")
 
 
 class CreateAgentResponse(BaseModel):
@@ -75,18 +123,32 @@ class CreateAgentResponse(BaseModel):
 
 
 class AddEdgeRequest(BaseModel):
-    src: str = Field(..., description="Existing agent name (source)")
-    dst: str = Field(..., description="Existing agent name (destination)")
-    bidirectional: bool = Field(default=False, description="If true, add edges both ways")
+    model_config = ConfigDict(extra="forbid")
+    src: AgentName = Field(..., description="Existing agent name (source)")
+    dst: AgentName = Field(..., description="Existing agent name (destination)")
+    bidirectional: bool = Field(default=False, description="If true, add reverse edge too")
 
 
 class AddEdgeResponse(BaseModel):
     added: bool
-    edges: List[Dict[str, str]]
+    edges: List[Dict[str, Any]]  # includes state
+
+
+class EdgeStateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    src: AgentName = Field(..., description="Existing agent name (source)")
+    dst: AgentName = Field(..., description="Existing agent name (destination)")
+    bidirectional: bool = Field(default=False, description="If true, apply to both directions")
+    state: Literal["NORMAL", "INACTIVE", "BROKEN"] = Field(..., description="Edge state")
+
+
+class EdgeStateResponse(BaseModel):
+    ok: bool
+    edges: List[Dict[str, Any]]
 
 
 # -------------------------
-# FastAPI App + Mango Runtime State
+# FastAPI app + runtime state
 # -------------------------
 app = FastAPI(title="Mango Runtime Server")
 
@@ -99,26 +161,63 @@ topology = None
 activation_manager = None
 
 
+def _require_agent(name: str):
+    if name not in agents_by_name:
+        raise HTTPException(status_code=400, detail=f"unknown agent: {name}")
+
+
+def _set_mango_edge_state(src_id: int, dst_id: int, state_str: str) -> None:
+    """
+    Best-effort: set edge state in Mango topology if supported.
+    Supports both signatures:
+      - set_edge_state(src_id, dst_id, state)
+      - set_edge_state((src_id, dst_id), state)
+    """
+    if topology is None or not hasattr(topology, "set_edge_state"):
+        return
+    if State is None:
+        return
+
+    if state_str == "NORMAL":
+        state = State.NORMAL
+    elif state_str == "INACTIVE":
+        state = State.INACTIVE
+    else:
+        state = State.BROKEN
+
+    # Try signature: set_edge_state(src_id, dst_id, state)
+    try:
+        topology.set_edge_state(src_id, dst_id, state)
+        return
+    except TypeError:
+        pass
+
+    # Fallback signature: set_edge_state((src_id, dst_id), state)
+    try:
+        topology.set_edge_state((src_id, dst_id), state)
+        return
+    except TypeError:
+        # If Mango topology doesn't support edge states, we still track it in registry
+        return
+
+
+
 @app.on_event("startup")
 async def startup():
     global container, topology_ctx, topology, activation_manager
 
-    # Avoid bind conflicts by letting OS pick a free port for Mango TCP container
     container = create_tcp_container(("127.0.0.1", 0))
 
     topology_ctx = create_topology()
     topology = topology_ctx.__enter__()
 
-    # Seed agent(s)
     router = DynamicAgent("router", "Routes messages and acts as the central hub.")
     router_id = topology.add_node(router)
     registry.add_node("router", router_id, router.persona)
     agents_by_name["router"] = router
 
-    # Register before activation
     container.register(router)
 
-    # Activate once for server lifetime (no container.start() call)
     activation_manager = activate(container)
     await activation_manager.__aenter__()
 
@@ -134,6 +233,69 @@ async def shutdown():
         topology_ctx.__exit__(None, None, None)
 
 
+@app.get("/tools")
+async def get_tools():
+    return {
+        "tools": [
+            {
+                "name": "get_topology",
+                "method": "GET",
+                "path": "/topology",
+                "description": "Get current agents and edges. Edges include a state: NORMAL, INACTIVE, BROKEN.",
+                "args_schema": {},
+            },
+            {
+                "name": "create_agent",
+                "method": "POST",
+                "path": "/agents",
+                "description": "Create a new agent and optionally connect it to existing agents.",
+                "args_schema": {
+                    "name": "snake_case string, required",
+                    "persona": "string (10-240 chars), required",
+                    "connect_to": "list of existing agent names, optional",
+                },
+                "name_rules": [
+                    "Use a domain noun like house_battery, pv_panels, ev_charger",
+                    "Do not use procedural names like create_agent_1, connect_agent_to_router",
+                ],
+            },
+            {
+                "name": "add_edge",
+                "method": "POST",
+                "path": "/edges",
+                "description": "Add an edge between two existing agents. Optionally add reverse edge. Adds with state NORMAL.",
+                "args_schema": {
+                    "src": "existing agent name, required",
+                    "dst": "existing agent name, required",
+                    "bidirectional": "bool, optional (default false)",
+                },
+            },
+            {
+                "name": "deactivate_edge",
+                "method": "POST",
+                "path": "/edges/deactivate",
+                "description": "Delete an edge by deactivating it (set state to INACTIVE). Optionally bidirectional.",
+                "args_schema": {
+                    "src": "existing agent name, required",
+                    "dst": "existing agent name, required",
+                    "bidirectional": "bool, optional (default false)",
+                },
+            },
+            {
+                "name": "activate_edge",
+                "method": "POST",
+                "path": "/edges/activate",
+                "description": "Activate an existing edge (set state to NORMAL). Optionally bidirectional.",
+                "args_schema": {
+                    "src": "existing agent name, required",
+                    "dst": "existing agent name, required",
+                    "bidirectional": "bool, optional (default false)",
+                },
+            },
+        ]
+    }
+
+
 @app.get("/topology")
 async def get_topology():
     return registry.export()
@@ -141,15 +303,15 @@ async def get_topology():
 
 @app.post("/agents", response_model=CreateAgentResponse)
 async def create_agent(req: CreateAgentRequest):
-    base = normalize_name(req.name)
-    name = unique_name(base, set(agents_by_name.keys()))
+    name = req.name
+    reject_bad_name(name)
 
-    persona = (req.persona or "").strip()
-    if len(persona) < 10:
-        raise HTTPException(status_code=400, detail="persona too short (min 10 chars)")
-
+    persona = req.persona.strip()
     connect_to = req.connect_to or []
-    connect_to = [normalize_name(x) for x in connect_to]
+
+    if name in agents_by_name:
+        name = unique_name(name, set(agents_by_name.keys()))
+        reject_bad_name(name)
 
     missing = [t for t in connect_to if t not in agents_by_name]
     if missing:
@@ -162,13 +324,14 @@ async def create_agent(req: CreateAgentRequest):
     agents_by_name[name] = agent
 
     for target in connect_to:
-        topology.add_edge(registry.nodes[name]["id"], registry.nodes[target]["id"])
-        registry.add_edge(name, target)
+        src_id = registry.nodes[name]["id"]
+        dst_id = registry.nodes[target]["id"]
+        topology.add_edge(src_id, dst_id)
+        registry.upsert_edge(name, target, state="NORMAL")
 
     if hasattr(topology, "inject"):
         topology.inject()
 
-    # Container is active; registering is enough
     container.register(agent)
 
     return CreateAgentResponse(created=True, name=name, node_id=node_id, connected_to=connect_to)
@@ -176,31 +339,89 @@ async def create_agent(req: CreateAgentRequest):
 
 @app.post("/edges", response_model=AddEdgeResponse)
 async def add_edge(req: AddEdgeRequest):
-    src = normalize_name(req.src)
-    dst = normalize_name(req.dst)
+    src = req.src
+    dst = req.dst
 
-    if src not in agents_by_name:
-        raise HTTPException(status_code=400, detail=f"unknown src agent: {src}")
-    if dst not in agents_by_name:
-        raise HTTPException(status_code=400, detail=f"unknown dst agent: {dst}")
+    _require_agent(src)
+    _require_agent(dst)
 
     src_id = registry.nodes[src]["id"]
     dst_id = registry.nodes[dst]["id"]
 
-    added_edges: List[Dict[str, str]] = []
+    changed_edges: List[Dict[str, Any]] = []
 
-    # Add src -> dst
+    # src -> dst
     topology.add_edge(src_id, dst_id)
-    registry.add_edge(src, dst)
-    added_edges.append({"from": src, "to": dst})
+    changed = registry.upsert_edge(src, dst, state="NORMAL")
+    changed_edges.append({"from": src, "to": dst, "state": registry.get_edge_state(src, dst)})
 
-    # Optional reverse edge
+    # reverse if needed
     if req.bidirectional and src != dst:
         topology.add_edge(dst_id, src_id)
-        registry.add_edge(dst, src)
-        added_edges.append({"from": dst, "to": src})
+        registry.upsert_edge(dst, src, state="NORMAL")
+        changed_edges.append({"from": dst, "to": src, "state": registry.get_edge_state(dst, src)})
 
     if hasattr(topology, "inject"):
         topology.inject()
 
-    return AddEdgeResponse(added=True, edges=added_edges)
+    return AddEdgeResponse(added=True, edges=changed_edges)
+
+
+@app.post("/edges/deactivate", response_model=EdgeStateResponse)
+async def deactivate_edge(req: AddEdgeRequest):
+    src = req.src
+    dst = req.dst
+
+    _require_agent(src)
+    _require_agent(dst)
+
+    src_id = registry.nodes[src]["id"]
+    dst_id = registry.nodes[dst]["id"]
+
+    updated: List[Dict[str, Any]] = []
+
+    # src -> dst inactive
+    _set_mango_edge_state(src_id, dst_id, "INACTIVE")
+    registry.upsert_edge(src, dst, state="INACTIVE")
+    updated.append({"from": src, "to": dst, "state": "INACTIVE"})
+
+    # optional reverse
+    if req.bidirectional and src != dst:
+        _set_mango_edge_state(dst_id, src_id, "INACTIVE")
+        registry.upsert_edge(dst, src, state="INACTIVE")
+        updated.append({"from": dst, "to": src, "state": "INACTIVE"})
+
+    if hasattr(topology, "inject"):
+        topology.inject()
+
+    return EdgeStateResponse(ok=True, edges=updated)
+
+
+@app.post("/edges/activate", response_model=EdgeStateResponse)
+async def activate_edge(req: AddEdgeRequest):
+    src = req.src
+    dst = req.dst
+
+    _require_agent(src)
+    _require_agent(dst)
+
+    src_id = registry.nodes[src]["id"]
+    dst_id = registry.nodes[dst]["id"]
+
+    updated: List[Dict[str, Any]] = []
+
+    # src -> dst normal
+    _set_mango_edge_state(src_id, dst_id, "NORMAL")
+    registry.upsert_edge(src, dst, state="NORMAL")
+    updated.append({"from": src, "to": dst, "state": "NORMAL"})
+
+    # optional reverse
+    if req.bidirectional and src != dst:
+        _set_mango_edge_state(dst_id, src_id, "NORMAL")
+        registry.upsert_edge(dst, src, state="NORMAL")
+        updated.append({"from": dst, "to": src, "state": "NORMAL"})
+
+    if hasattr(topology, "inject"):
+        topology.inject()
+
+    return EdgeStateResponse(ok=True, edges=updated)

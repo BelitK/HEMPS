@@ -1,173 +1,188 @@
 import asyncio
 import json
-from typing import Optional, List, Literal, Union, Set
+from typing import Optional, Literal, Dict, Any, List
 
 import httpx
-from pydantic import BaseModel, Field, ConfigDict, constr
+from pydantic import BaseModel, Field, ConfigDict
 
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
 
-# =========================================================
-# 1) Strict identifier type (prevents planning labels)
-# =========================================================
-AgentName = constr(pattern=r"^[a-z][a-z0-9_]{0,31}$")  # router, battery_agent, ev_charger
-
-
-# =========================================================
-# 2) Step schemas (extra forbidden prevents schema drift)
-# =========================================================
-class CreateAgentStep(BaseModel):
+class ToolDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    type: Literal["create_agent"] = "create_agent"
-    name: AgentName = Field(..., description="New agent name (snake_case)")
-    persona: str = Field(..., min_length=10, max_length=240, description="1-2 sentence role")
-    connect_to: Optional[List[AgentName]] = Field(default=None, description="Existing agent names to connect to")
+    action: Literal["call_tool", "reply"]
+
+    # call_tool
+    tool_name: Optional[str] = Field(default=None, description="Must match one of tools[].name from /tools")
+    args: Dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool call")
+
+    # reply
+    text: Optional[str] = None
+
+    # private notes (NOT executed, NOT sent to server)
+    notes: Optional[str] = Field(
+        default=None,
+        max_length=800,
+        description="Private reasoning/notes for this step. Never include tool arguments here."
+    )
 
 
-class AddEdgeStep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["add_edge"] = "add_edge"
-    src: AgentName = Field(..., description="Existing agent name (source)")
-    dst: AgentName = Field(..., description="Existing agent name (destination)")
-    bidirectional: bool = Field(default=False, description="Add edges both ways if true")
-
-
-class ReplyStep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["reply"] = "reply"
-    text: str = Field(..., description="Assistant reply to user")
-
-
-Step = Union[CreateAgentStep, AddEdgeStep, ReplyStep]
-
-
-class Plan(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    steps: List[Step] = Field(default_factory=list, description="Ordered list of actions to execute")
-    final_reply: Optional[str] = Field(default=None, description="Optional final message summarizing what happened")
-
-
-# =========================================================
-# 3) LLM setup
-# =========================================================
-llm = ChatOllama(model="mistral:7b", temperature=0)
+llm = ChatOllama(model="gemma3:12b", temperature=0.15)
 
 prompt = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a conversational assistant that also manages a Mango multi-agent system.\n"
-     "For each user message, output a multi-step Plan.\n\n"
-     "CRITICAL RULES:\n"
-     "- Agent names must be real topology agent names OR a new snake_case name like battery_agent.\n"
-     "- NEVER use placeholder step labels as agent names (examples of forbidden names: create_5_new_agents, "
-     "set_agent_properties, repeat_step_1).\n"
-     "- connect_to/src/dst must reference existing agent names from the topology.\n"
-     "- If an agent must be created before wiring, put create_agent steps first.\n"
-     "- If the user is just chatting, return one reply step.\n"
-     "Return only a Plan object."
+     "You are a conversational assistant controlling a Mango multi-agent system using server-exposed HTTP tools.\n"
+     "You must operate in a loop: each step choose exactly one action.\n\n"
+     "You will receive a JSON list of tools from the server at /tools.\n"
+     "To do any change, select one tool by name and provide args.\n\n"
+     "Important:\n"
+     "- You may include private notes in the 'notes' field for debugging.\n"
+     "- Notes are never executed and never sent to the server.\n"
+     "- Do not put tool parameters in notes. Put them in args.\n\n"
+     "Rules:\n"
+     "- Always choose tool_name from the tools list.\n"
+     "- Provide args that match the tool args_schema.\n"
+     "- If the last tool call returned an error, fix it in the next step.\n"
+     "- When the user request is satisfied, respond with action=reply and a short summary.\n"
+     "Return only a ToolDecision object."
     ),
     MessagesPlaceholder("history"),
-    ("human", "User message: {user_input}\n\nCurrent topology JSON: {topology_json}\n")
+    ("human",
+     "User message:\n{user_input}\n\n"
+     "Tools JSON:\n{tools_json}\n\n"
+     "Live topology JSON:\n{topology_json}\n\n"
+     "This-turn execution log (most recent last):\n{exec_log}\n")
 ])
 
-plan_chain = prompt | llm.with_structured_output(Plan)
+decision_chain = prompt | llm.with_structured_output(ToolDecision)
+
+MAX_STEPS = 20
 
 
-# =========================================================
-# 4) Helpers
-# =========================================================
-def topo_names(topo: dict) -> Set[str]:
-    return {n.get("name") for n in topo.get("nodes", []) if isinstance(n.get("name"), str)}
+def index_tools(tools_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    tools = tools_payload.get("tools", [])
+    out: Dict[str, Dict[str, Any]] = {}
+    for t in tools:
+        name = t.get("name")
+        if isinstance(name, str):
+            out[name] = t
+    return out
 
 
-# =========================================================
-# 5) Conversation loop with multi-step execution
-# =========================================================
+async def call_server_tool(client: httpx.AsyncClient, tool_def: Dict[str, Any], args: Dict[str, Any]) -> httpx.Response:
+    method = (tool_def.get("method") or "GET").upper()
+    path = tool_def.get("path") or "/"
+
+    if method == "GET":
+        return await client.get(path, params=args or None)
+    if method == "POST":
+        return await client.post(path, json=args)
+    if method == "PUT":
+        return await client.put(path, json=args)
+    if method == "PATCH":
+        return await client.patch(path, json=args)
+    if method == "DELETE":
+        return await client.delete(path, params=args or None)
+
+    raise RuntimeError(f"Unsupported HTTP method in tool definition: {method}")
+
+
 async def main():
-    print("Chat started. Commands: /exit, /topo")
-    history = []
+    print("Tool-loop chat started. Commands: /exit, /topo")
+    history: List[Any] = []
 
     async with httpx.AsyncClient(base_url="http://127.0.0.1:8000", timeout=30) as client:
         while True:
             user_input = input("\nYou> ").strip()
             if not user_input:
                 continue
-
             if user_input == "/exit":
                 break
 
-            topo = (await client.get("/topology")).json()
-
             if user_input == "/topo":
+                topo = (await client.get("/topology")).json()
                 print(json.dumps(topo, indent=2))
                 continue
 
-            plan: Plan = await plan_chain.ainvoke({
-                "history": history,
-                "user_input": user_input,
-                "topology_json": topo,
-            })
+            exec_log: List[Dict[str, Any]] = []
 
-            executed_msgs: List[str] = []
-
-            for step in plan.steps:
-                # Always refresh topology so later steps see newly created agents
+            for _ in range(MAX_STEPS):
                 topo = (await client.get("/topology")).json()
-                names = topo_names(topo)
+                tools_payload = (await client.get("/tools")).json()
+                tools_by_name = index_tools(tools_payload)
 
-                if isinstance(step, ReplyStep):
-                    executed_msgs.append(step.text)
+                decision: ToolDecision = await decision_chain.ainvoke({
+                    "history": history,
+                    "user_input": user_input,
+                    "tools_json": tools_payload,
+                    "topology_json": topo,
+                    "exec_log": exec_log,
+                })
+
+                # Print notes locally (optional)
+                if decision.notes:
+                    print(f"[notes] {decision.notes}")
+
+                if decision.action == "reply":
+                    text = decision.text or "Done."
+                    print(f"Assistant> {text}")
+                    history.append(HumanMessage(content=user_input))
+                    history.append(AIMessage(content=text))
+                    break
+
+                tool_name = (decision.tool_name or "").strip()
+                if tool_name not in tools_by_name:
+                    exec_log.append({
+                        "action": "call_tool",
+                        "tool_name": tool_name,
+                        "args": decision.args,
+                        "error": f"Unknown tool_name. Must be one of: {sorted(list(tools_by_name.keys()))}",
+                    })
                     continue
 
-                if isinstance(step, CreateAgentStep):
-                    # Ensure connect_to exists; default to router if available
-                    connect_to = list(step.connect_to or [])
-                    if not connect_to and "router" in names:
-                        connect_to = ["router"]
+                tool_def = tools_by_name[tool_name]
+                args = decision.args or {}
 
-                    # Filter to existing names only (extra safety)
-                    connect_to = [x for x in connect_to if x in names]
+                try:
+                    r = await call_server_tool(client, tool_def, args)
 
-                    payload = {
-                        "name": step.name,
-                        "persona": step.persona,
-                        "connect_to": connect_to,
-                    }
-                    res = (await client.post("/agents", json=payload)).json()
-                    executed_msgs.append(
-                        f"Created agent {res.get('name', payload['name'])} connected to {res.get('connected_to', [])}."
-                    )
+                    if r.status_code >= 400:
+                        exec_log.append({
+                            "action": "call_tool",
+                            "tool_name": tool_name,
+                            "args": args,
+                            "error": {"status": r.status_code, "detail": r.text},
+                        })
+                    else:
+                        try:
+                            result = r.json()
+                        except Exception:
+                            result = {"raw": r.text}
+
+                        exec_log.append({
+                            "action": "call_tool",
+                            "tool_name": tool_name,
+                            "args": args,
+                            "result": result,
+                        })
+
+                    print(f"{tool_name} -> {r.status_code}")
+                except Exception as e:
+                    exec_log.append({
+                        "action": "call_tool",
+                        "tool_name": tool_name,
+                        "args": args,
+                        "error": str(e),
+                    })
                     continue
 
-                if isinstance(step, AddEdgeStep):
-                    # Hard gate: only add edges between existing agents
-                    if step.src not in names or step.dst not in names:
-                        executed_msgs.append(
-                            f"Skipped edge {step.src}->{step.dst} (unknown agent name)."
-                        )
-                        continue
-
-                    payload = {
-                        "src": step.src,
-                        "dst": step.dst,
-                        "bidirectional": bool(step.bidirectional),
-                    }
-                    res = (await client.post("/edges", json=payload)).json()
-                    executed_msgs.append(f"Added edges: {res.get('edges', [])}")
-                    continue
-
-            # Choose a final assistant message
-            if plan.final_reply:
-                assistant_text = plan.final_reply
             else:
-                assistant_text = "\n".join(executed_msgs) if executed_msgs else "Okay."
-
-            print(f"Assistant> {assistant_text}")
-
-            history.append(HumanMessage(content=user_input))
-            history.append(AIMessage(content=assistant_text))
+                text = "I hit the step limit for this request. Try splitting it into smaller parts."
+                print(f"Assistant> {text}")
+                history.append(HumanMessage(content=user_input))
+                history.append(AIMessage(content=text))
 
 
 if __name__ == "__main__":
