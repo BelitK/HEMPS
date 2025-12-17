@@ -104,6 +104,7 @@ else
     uv pip install .
 fi
 
+<<<<<<< HEAD
 # -------------------------------
 # Step 5: Optional Ollama model download
 # -------------------------------
@@ -139,3 +140,8 @@ else
 fi
 
 echo "✅ Setup complete. Run your project with: python main.py"
+=======
+echo "✅ Setup complete. Run your project with: python main.py"
+
+## TODO: Add ollama installer
+>>>>>>> origin/main

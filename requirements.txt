@@ -1,1 +1,3 @@
 mango-agents==2.1.2
+aiohttp>=3.9.0
+numpy
