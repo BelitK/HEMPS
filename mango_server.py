@@ -425,3 +425,8 @@ async def activate_edge(req: AddEdgeRequest):
         topology.inject()
 
     return EdgeStateResponse(ok=True, edges=updated)
+
+
+# TODO add llm trigger for unknown phenomenon, after trigger llm will gather data from mesh network and devise a plan then execute to compansate for the situation
+# TODO separation of functions for better modularity and testing also classes for better state management
+# TODO 

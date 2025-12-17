@@ -187,3 +187,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# TODO add tiny webhook for server side llm triggers (unknown phenomenon detection and handling)
