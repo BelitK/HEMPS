@@ -1,50 +1,52 @@
 import asyncio
 import json
-from typing import Optional, List, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any, List
 
 import httpx
-from pydantic import BaseModel, Field, ConfigDict, constr
+from pydantic import BaseModel, Field, ConfigDict
 
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
 
-AgentName = constr(pattern=r"^[a-z][a-z0-9_]{0,31}$")
-
-
-class OneAction(BaseModel):
+class ToolDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: Literal["create_agent", "add_edge", "reply"]
+    action: Literal["call_tool", "reply"]
 
-    # create_agent
-    name: Optional[AgentName] = None
-    persona: Optional[str] = Field(default=None, min_length=10, max_length=240)
-    connect_to: Optional[List[AgentName]] = None
-
-    # add_edge
-    src: Optional[AgentName] = None
-    dst: Optional[AgentName] = None
-    bidirectional: bool = False
+    # call_tool
+    tool_name: Optional[str] = Field(default=None, description="Must match one of tools[].name from /tools")
+    args: Dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool call")
 
     # reply
     text: Optional[str] = None
 
+    # private notes (NOT executed, NOT sent to server)
+    notes: Optional[str] = Field(
+        default=None,
+        max_length=800,
+        description="Private reasoning/notes for this step. Never include tool arguments here."
+    )
 
-llm = ChatOllama(model="gemma3:12b", temperature=0)
+
+llm = ChatOllama(model="gemma3:12b", temperature=0.15)
 
 prompt = ChatPromptTemplate.from_messages([
     ("system",
-     "You are a conversational assistant that manages a Mango multi-agent system via HTTP tools.\n"
-     "You must act in a loop: choose exactly one action each time.\n"
-     "Available tools are provided as JSON.\n\n"
+     "You are a conversational assistant controlling a Mango multi-agent system using server-exposed HTTP tools.\n"
+     "You must operate in a loop: each step choose exactly one action.\n\n"
+     "You will receive a JSON list of tools from the server at /tools.\n"
+     "To do any change, select one tool by name and provide args.\n\n"
+     "Important:\n"
+     "- You may include private notes in the 'notes' field for debugging.\n"
+     "- Notes are never executed and never sent to the server.\n"
+     "- Do not put tool parameters in notes. Put them in args.\n\n"
      "Rules:\n"
-     "- Never output procedural names like create_agent_1 or connect_agent_to_router.\n"
-     "- Agent names must be domain nouns like house_battery, pv_panels, ev_charger.\n"
-     "- For add_edge, src and dst must be existing agent names from the live topology.\n"
-     "- If a server error occurs, fix it in the next action.\n"
-     "- When all requested changes are done, return action=reply with a short summary.\n"
-     "Return only a OneAction object."
+     "- Always choose tool_name from the tools list.\n"
+     "- Provide args that match the tool args_schema.\n"
+     "- If the last tool call returned an error, fix it in the next step.\n"
+     "- When the user request is satisfied, respond with action=reply and a short summary.\n"
+     "Return only a ToolDecision object."
     ),
     MessagesPlaceholder("history"),
     ("human",
@@ -54,19 +56,44 @@ prompt = ChatPromptTemplate.from_messages([
      "This-turn execution log (most recent last):\n{exec_log}\n")
 ])
 
-action_chain = prompt | llm.with_structured_output(OneAction)
-
+decision_chain = prompt | llm.with_structured_output(ToolDecision)
 
 MAX_STEPS = 20
 
 
+def index_tools(tools_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    tools = tools_payload.get("tools", [])
+    out: Dict[str, Dict[str, Any]] = {}
+    for t in tools:
+        name = t.get("name")
+        if isinstance(name, str):
+            out[name] = t
+    return out
+
+
+async def call_server_tool(client: httpx.AsyncClient, tool_def: Dict[str, Any], args: Dict[str, Any]) -> httpx.Response:
+    method = (tool_def.get("method") or "GET").upper()
+    path = tool_def.get("path") or "/"
+
+    if method == "GET":
+        return await client.get(path, params=args or None)
+    if method == "POST":
+        return await client.post(path, json=args)
+    if method == "PUT":
+        return await client.put(path, json=args)
+    if method == "PATCH":
+        return await client.patch(path, json=args)
+    if method == "DELETE":
+        return await client.delete(path, params=args or None)
+
+    raise RuntimeError(f"Unsupported HTTP method in tool definition: {method}")
+
+
 async def main():
     print("Tool-loop chat started. Commands: /exit, /topo")
-    history = []
+    history: List[Any] = []
 
     async with httpx.AsyncClient(base_url="http://127.0.0.1:8000", timeout=30) as client:
-        tools = (await client.get("/tools")).json()
-
         while True:
             user_input = input("\nYou> ").strip()
             if not user_input:
@@ -81,82 +108,81 @@ async def main():
 
             exec_log: List[Dict[str, Any]] = []
 
-            # loop until reply
             for _ in range(MAX_STEPS):
                 topo = (await client.get("/topology")).json()
+                tools_payload = (await client.get("/tools")).json()
+                tools_by_name = index_tools(tools_payload)
 
-                act: OneAction = await action_chain.ainvoke({
+                decision: ToolDecision = await decision_chain.ainvoke({
                     "history": history,
                     "user_input": user_input,
-                    "tools_json": tools,
+                    "tools_json": tools_payload,
                     "topology_json": topo,
                     "exec_log": exec_log,
                 })
 
-                if act.action == "reply":
-                    text = act.text or "Done."
+                # Print notes locally (optional)
+                if decision.notes:
+                    print(f"[notes] {decision.notes}")
+
+                if decision.action == "reply":
+                    text = decision.text or "Done."
                     print(f"Assistant> {text}")
                     history.append(HumanMessage(content=user_input))
                     history.append(AIMessage(content=text))
                     break
 
-                if act.action == "create_agent":
-                    payload = {
-                        "name": act.name,
-                        "persona": act.persona,
-                        "connect_to": act.connect_to or [],
-                    }
-                    try:
-                        r = await client.post("/agents", json=payload)
-                        if r.status_code >= 400:
-                            exec_log.append({
-                                "action": "create_agent",
-                                "payload": payload,
-                                "error": {"status": r.status_code, "detail": r.text},
-                            })
-                        else:
-                            exec_log.append({
-                                "action": "create_agent",
-                                "payload": payload,
-                                "result": r.json(),
-                            })
-                    except Exception as e:
-                        exec_log.append({"action": "create_agent", "payload": payload, "error": str(e)})
+                tool_name = (decision.tool_name or "").strip()
+                if tool_name not in tools_by_name:
+                    exec_log.append({
+                        "action": "call_tool",
+                        "tool_name": tool_name,
+                        "args": decision.args,
+                        "error": f"Unknown tool_name. Must be one of: {sorted(list(tools_by_name.keys()))}",
+                    })
                     continue
 
-                if act.action == "add_edge":
-                    payload = {
-                        "src": act.src,
-                        "dst": act.dst,
-                        "bidirectional": bool(act.bidirectional),
-                    }
-                    try:
-                        r = await client.post("/edges", json=payload)
-                        if r.status_code >= 400:
-                            exec_log.append({
-                                "action": "add_edge",
-                                "payload": payload,
-                                "error": {"status": r.status_code, "detail": r.text},
-                            })
-                        else:
-                            exec_log.append({
-                                "action": "add_edge",
-                                "payload": payload,
-                                "result": r.json(),
-                            })
-                        print(r.status_code, r.text)
-                    except Exception as e:
-                        exec_log.append({"action": "add_edge", "payload": payload, "error": str(e)})
+                tool_def = tools_by_name[tool_name]
+                args = decision.args or {}
+
+                try:
+                    r = await call_server_tool(client, tool_def, args)
+
+                    if r.status_code >= 400:
+                        exec_log.append({
+                            "action": "call_tool",
+                            "tool_name": tool_name,
+                            "args": args,
+                            "error": {"status": r.status_code, "detail": r.text},
+                        })
+                    else:
+                        try:
+                            result = r.json()
+                        except Exception:
+                            result = {"raw": r.text}
+
+                        exec_log.append({
+                            "action": "call_tool",
+                            "tool_name": tool_name,
+                            "args": args,
+                            "result": result,
+                        })
+
+                    print(f"{tool_name} -> {r.status_code}")
+                except Exception as e:
+                    exec_log.append({
+                        "action": "call_tool",
+                        "tool_name": tool_name,
+                        "args": args,
+                        "error": str(e),
+                    })
                     continue
-                print(f"{act.action}")
+
             else:
-                # max steps exceeded
                 text = "I hit the step limit for this request. Try splitting it into smaller parts."
                 print(f"Assistant> {text}")
                 history.append(HumanMessage(content=user_input))
                 history.append(AIMessage(content=text))
-
-                
 
 
 if __name__ == "__main__":
