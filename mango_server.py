@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, constr
 
 from mango import Agent, create_topology, activate, create_tcp_container
+from agents.dynamic_agent import DynamicAgent
 
 # Try importing Mango State enum for link activation
 try:
@@ -42,17 +43,6 @@ def reject_bad_name(name: str) -> None:
             )
 
 
-# -------------------------
-# Mango Agent
-# -------------------------
-class DynamicAgent(Agent):
-    def __init__(self, name: str, persona: str):
-        super().__init__()
-        self.name = name
-        self.persona = persona
-
-    def handle_message(self, content, meta):
-        print(f"[{self.name}] {content}")
 
 
 # -------------------------
