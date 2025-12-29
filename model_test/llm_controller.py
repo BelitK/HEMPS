@@ -62,8 +62,8 @@ prompt = ChatPromptTemplate.from_messages([
 ])
 
 decision_chain = prompt | llm.with_structured_output(ToolDecision)
-
-MAX_STEPS = 20
+# Change this based on expected complexity of user requests
+MAX_STEPS = 40
 
 
 def index_tools(tools_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:

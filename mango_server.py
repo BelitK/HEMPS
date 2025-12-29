@@ -17,6 +17,8 @@ except Exception:
     State = None  # Fallback: we will still track state in registry
 
 
+# TODO add forecasting for other agent types and add to startup
+
 # -------------------------
 # Guards
 # -------------------------
@@ -27,6 +29,7 @@ AgentName = constr(pattern=r"^[a-z][a-z0-9_]{0,31}$")
 # API Schemas
 # -------------------------
 class CreateAgentRequest(BaseModel):
+    # add agent type for different types
     model_config = ConfigDict(extra="forbid")
     name: AgentName = Field(..., description="Unique agent name (snake_case)")
     state: Literal["NORMAL", "INACTIVE", "BROKEN"] = Field(..., description="Agent state")
@@ -35,8 +38,10 @@ class CreateAgentRequest(BaseModel):
 
 
 class CreateAgentResponse(BaseModel):
+    # add agent type to response model
     created: bool
     name: str
+    state: str
     node_id: int
     connected_to: List[str]
 
@@ -167,6 +172,7 @@ async def get_agents():
 
 @app.post("/agents", response_model=CreateAgentResponse)
 async def create_agent(req: CreateAgentRequest):
+    # add agent type for different types
     name = req.name
     CheckTools.reject_bad_name(name)
     print(req)
@@ -181,7 +187,7 @@ async def create_agent(req: CreateAgentRequest):
     missing = [t for t in connect_to if t not in agents_by_name]
     if missing:
         raise HTTPException(status_code=400, detail=f"unknown connect_to targets: {missing}")
-
+    # make this a choice later
     agent = DynamicAgent(name, persona)
 
     node_id = topology.add_node(agent)
@@ -199,7 +205,7 @@ async def create_agent(req: CreateAgentRequest):
 
     container.register(agent)
 
-    return CreateAgentResponse(created=True, name=name, node_id=node_id, connected_to=connect_to)
+    return CreateAgentResponse(created=True, name=name, node_id=node_id, connected_to=connect_to, state=state)
 
 
 @app.post("/edges", response_model=AddEdgeResponse)

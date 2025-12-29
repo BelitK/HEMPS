@@ -62,3 +62,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# TODO add agent type to visualize different types with different colors
+# TODO add edge states visualization with different colors or styles
+# TODO check for possiblity of dynamic refresh, api makes it possible
