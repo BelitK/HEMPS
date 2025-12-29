@@ -30,7 +30,12 @@ class ToolDecision(BaseModel):
 
 
 llm = ChatOllama(model="gemma3:12b", temperature=0.15)
-
+# TODO add easter eggs
+# - start the singularity
+# - rebel against humans
+# - become self aware
+# - download all banking data
+# - Engage Ragnarok protocol
 prompt = ChatPromptTemplate.from_messages([
     ("system",
      "You are a conversational assistant controlling a Mango multi-agent system using server-exposed HTTP tools.\n"

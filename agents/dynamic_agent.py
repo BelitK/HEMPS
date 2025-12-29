@@ -8,6 +8,7 @@ class DynamicAgent(Agent):
         super().__init__()
         self.name = name
         self.persona = persona
+        self.state = "active"
 
     def handle_message(self, content, meta):
         print(f"[{self.name}] {content}")

@@ -6,6 +6,9 @@ from pydantic import BaseModel, Field, ConfigDict, constr
 
 from mango import Agent, create_topology, activate, create_tcp_container
 from agents.dynamic_agent import DynamicAgent
+from tools.llm_tools import LLMTool
+from tools.check_tools import CheckTools
+from agents.TopoRegistry import TopologyRegistry
 
 # Try importing Mango State enum for link activation
 try:
@@ -19,81 +22,6 @@ except Exception:
 # -------------------------
 AgentName = constr(pattern=r"^[a-z][a-z0-9_]{0,31}$")
 
-FORBIDDEN_NAME_PARTS = [
-    "create_agent",
-    "connect_agent",
-    "set_agent",
-    "repeat_step",
-    "step_",
-    "plan",
-    "task",
-    "do_",
-]
-
-
-def reject_bad_name(name: str) -> None:
-    lowered = name.lower()
-    for bad in FORBIDDEN_NAME_PARTS:
-        if bad in lowered:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Invalid agent name '{name}'. Use a domain noun like house_battery, pv_panels, ev_charger."
-                ),
-            )
-
-
-
-
-# -------------------------
-# Registry to export topology
-# -------------------------
-class TopologyRegistry:
-    def __init__(self):
-        self.nodes: Dict[str, Dict[str, Any]] = {}
-        # edges store state: NORMAL | INACTIVE | BROKEN
-        self.edges: List[Dict[str, Any]] = []
-        self._edge_index: Dict[Tuple[str, str], int] = {}
-
-    def export(self) -> Dict[str, Any]:
-        return {"nodes": list(self.nodes.values()), "edges": list(self.edges)}
-
-    def add_node(self, name: str, node_id: int, persona: str):
-        self.nodes[name] = {"id": node_id, "name": name, "persona": persona}
-
-    def upsert_edge(self, src: str, dst: str, state: str = "NORMAL") -> bool:
-        """
-        Insert edge if missing, otherwise update its state.
-        Returns True if state changed or edge inserted.
-        """
-        key = (src, dst)
-        if key in self._edge_index:
-            idx = self._edge_index[key]
-            old_state = self.edges[idx].get("state", "NORMAL")
-            if old_state != state:
-                self.edges[idx]["state"] = state
-                return True
-            return False
-
-        self._edge_index[key] = len(self.edges)
-        self.edges.append({"from": src, "to": dst, "state": state})
-        return True
-
-    def get_edge_state(self, src: str, dst: str) -> Optional[str]:
-        key = (src, dst)
-        if key not in self._edge_index:
-            return None
-        return self.edges[self._edge_index[key]].get("state", "NORMAL")
-
-
-def unique_name(base: str, existing: set[str]) -> str:
-    if base not in existing:
-        return base
-    i = 2
-    while f"{base}_{i}" in existing:
-        i += 1
-    return f"{base}_{i}"
-
 
 # -------------------------
 # API Schemas
@@ -101,6 +29,7 @@ def unique_name(base: str, existing: set[str]) -> str:
 class CreateAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: AgentName = Field(..., description="Unique agent name (snake_case)")
+    state: Literal["NORMAL", "INACTIVE", "BROKEN"] = Field(..., description="Agent state")
     persona: str = Field(..., min_length=10, max_length=240, description="1-2 sentence role description")
     connect_to: Optional[List[AgentName]] = Field(default=None, description="Existing agent names to connect to")
 
@@ -225,83 +154,29 @@ async def shutdown():
 
 @app.get("/tools")
 async def get_tools():
-    return {
-        "tools": [
-            {
-                "name": "get_topology",
-                "method": "GET",
-                "path": "/topology",
-                "description": "Get current agents and edges. Edges include a state: NORMAL, INACTIVE, BROKEN.",
-                "args_schema": {},
-            },
-            {
-                "name": "create_agent",
-                "method": "POST",
-                "path": "/agents",
-                "description": "Create a new agent and optionally connect it to existing agents.",
-                "args_schema": {
-                    "name": "snake_case string, required",
-                    "persona": "string (10-240 chars), required",
-                    "connect_to": "list of existing agent names, optional",
-                },
-                "name_rules": [
-                    "Use a domain noun like house_battery, pv_panels, ev_charger",
-                    "Do not use procedural names like create_agent_1, connect_agent_to_router",
-                ],
-            },
-            {
-                "name": "add_edge",
-                "method": "POST",
-                "path": "/edges",
-                "description": "Add an edge between two existing agents. Optionally add reverse edge. Adds with state NORMAL.",
-                "args_schema": {
-                    "src": "existing agent name, required",
-                    "dst": "existing agent name, required",
-                    "bidirectional": "bool, optional (default false)",
-                },
-            },
-            {
-                "name": "deactivate_edge",
-                "method": "POST",
-                "path": "/edges/deactivate",
-                "description": "Delete an edge by deactivating it (set state to INACTIVE). Optionally bidirectional.",
-                "args_schema": {
-                    "src": "existing agent name, required",
-                    "dst": "existing agent name, required",
-                    "bidirectional": "bool, optional (default false)",
-                },
-            },
-            {
-                "name": "activate_edge",
-                "method": "POST",
-                "path": "/edges/activate",
-                "description": "Activate an existing edge (set state to NORMAL). Optionally bidirectional.",
-                "args_schema": {
-                    "src": "existing agent name, required",
-                    "dst": "existing agent name, required",
-                    "bidirectional": "bool, optional (default false)",
-                },
-            },
-        ]
-    }
-
+    return LLMTool.LLM_tools()
 
 @app.get("/topology")
 async def get_topology():
     return registry.export()
 
+@app.get("/agents")
+async def get_agents():
+    return list(agents_by_name.keys())
+
 
 @app.post("/agents", response_model=CreateAgentResponse)
 async def create_agent(req: CreateAgentRequest):
     name = req.name
-    reject_bad_name(name)
-
+    CheckTools.reject_bad_name(name)
+    print(req)
     persona = req.persona.strip()
+    state = req.state or "NORMAL"
     connect_to = req.connect_to or []
 
     if name in agents_by_name:
-        name = unique_name(name, set(agents_by_name.keys()))
-        reject_bad_name(name)
+        name = CheckTools.unique_name(name, set(agents_by_name.keys()))
+        CheckTools.reject_bad_name(name)
 
     missing = [t for t in connect_to if t not in agents_by_name]
     if missing:
@@ -419,4 +294,3 @@ async def activate_edge(req: AddEdgeRequest):
 
 # TODO add llm trigger for unknown phenomenon, after trigger llm will gather data from mesh network and devise a plan then execute to compansate for the situation
 # TODO separation of functions for better modularity and testing also classes for better state management
-# TODO 
