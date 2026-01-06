@@ -12,7 +12,7 @@ def load_topology():
     r.raise_for_status()
     return r.json()
 
-def main():
+def visualize_topo():
     topo = load_topology()
 
     # Build lookup by name, because edges reference names
@@ -60,8 +60,7 @@ def main():
     net.write_html(OUT_HTML, open_browser=False, notebook=False)
     print(f"Wrote {OUT_HTML} (open it in your browser)")
 
-if __name__ == "__main__":
-    main()
+
 
 # TODO add agent type to visualize different types with different colors
 # TODO add edge states visualization with different colors or styles

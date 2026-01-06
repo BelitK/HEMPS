@@ -1,7 +1,7 @@
 import re
 from typing import Any, Dict, List, Optional, Literal, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field, ConfigDict, constr
 from fastapi_mcp import FastApiMCP
 
@@ -9,6 +9,7 @@ from mango import Agent, create_topology, activate, create_tcp_container
 from agents.dynamic_agent import DynamicAgent, IOAgent, BatteryAgent
 from tools.check_tools import CheckTools
 from agents.TopoRegistry import TopologyRegistry
+from tools.visualize import visualize_topo
 
 # Try importing Mango State enum for link activation
 try:
@@ -322,6 +323,17 @@ async def activate_edge(req: AddEdgeRequest):
 
     return EdgeStateResponse(ok=True, edges=updated)
 
+
+@app.get("/visualize")
+async def visualize_topology(background: BackgroundTasks):
+    """
+    Generate and return topology visualization HTML file.
+    """
+    try:
+        background.add_task(visualize_topo)
+    except Exception as e:
+        print(f"Error visualizing topology: {e}")
+    return {"status": "started", "html_file": "mango_topology.html"}
 
 mcp.setup_server()
 mcp.mount_http()
