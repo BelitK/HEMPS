@@ -3,10 +3,10 @@ from typing import Any, Dict, List, Optional, Literal, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, constr
+from fastapi_mcp import FastApiMCP
 
 from mango import Agent, create_topology, activate, create_tcp_container
-from agents.dynamic_agent import DynamicAgent
-from tools.llm_tools import LLMTool
+from agents.dynamic_agent import DynamicAgent, IOAgent, BatteryAgent
 from tools.check_tools import CheckTools
 from agents.TopoRegistry import TopologyRegistry
 
@@ -18,6 +18,9 @@ except Exception:
 
 
 # TODO add forecasting for other agent types and add to startup
+# TODO add agent removal API
+# TODO change the usage from explanation to custom functionality for different agent types : right now in implementation phase
+
 
 # -------------------------
 # Guards
@@ -33,6 +36,7 @@ class CreateAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: AgentName = Field(..., description="Unique agent name (snake_case)")
     state: Literal["NORMAL", "INACTIVE", "BROKEN"] = Field(..., description="Agent state")
+    usage: str = Field(..., min_length=10, max_length=240, description="1-2 sentence usage description")
     persona: str = Field(..., min_length=10, max_length=240, description="1-2 sentence role description")
     connect_to: Optional[List[AgentName]] = Field(default=None, description="Existing agent names to connect to")
 
@@ -70,11 +74,24 @@ class EdgeStateResponse(BaseModel):
     ok: bool
     edges: List[Dict[str, Any]]
 
+class SendMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dst: AgentName = Field(..., description="Existing agent name (destination)")
+    content: str = Field(..., min_length=1, max_length=1000, description="Message content")
+
 
 # -------------------------
 # FastAPI app + runtime state
 # -------------------------
 app = FastAPI(title="Mango Runtime Server")
+
+mcp = FastApiMCP(app, name="Mango Runtime MCP",
+    describe_full_response_schema=True,  # Describe the full response JSON-schema instead of just a response example
+    describe_all_responses=True,  # Describe all the possible responses instead of just the success (2XX) response)
+)
+
+# Mount the MCP server directly to your FastAPI app
+
 
 registry = TopologyRegistry()
 agents_by_name: Dict[str, DynamicAgent] = {}
@@ -134,15 +151,23 @@ async def startup():
 
     topology_ctx = create_topology()
     topology = topology_ctx.__enter__()
-
-    router = DynamicAgent("router", "Routes messages and acts as the central hub.")
+    # creating topology registry
+    router = DynamicAgent("router", "Routes messages and acts as the central hub.", "network router")
     router_id = topology.add_node(router)
     registry.add_node("router", router_id, router.persona)
     agents_by_name["router"] = router
 
     container.register(router)
+    # first test agent for development, gonna remove before presentation
+    test_agent = IOAgent()
+    test_agent_id = topology.add_node(test_agent)
+    registry.add_node("test_agent", test_agent_id, test_agent.persona)
+    agents_by_name["test_agent"] = test_agent
+
+    container.register(test_agent)
 
     activation_manager = activate(container)
+    print()
     await activation_manager.__aenter__()
 
 
@@ -156,10 +181,9 @@ async def shutdown():
     if topology_ctx is not None:
         topology_ctx.__exit__(None, None, None)
 
-
-@app.get("/tools")
-async def get_tools():
-    return LLMTool.LLM_tools()
+@app.get("/agent_list")
+async def get_agent_list():
+    return list(Agent.__subclasses__())
 
 @app.get("/topology")
 async def get_topology():
@@ -178,6 +202,7 @@ async def create_agent(req: CreateAgentRequest):
     print(req)
     persona = req.persona.strip()
     state = req.state or "NORMAL"
+    usage = req.usage or "Not specified."
     connect_to = req.connect_to or []
 
     if name in agents_by_name:
@@ -188,7 +213,7 @@ async def create_agent(req: CreateAgentRequest):
     if missing:
         raise HTTPException(status_code=400, detail=f"unknown connect_to targets: {missing}")
     # make this a choice later
-    agent = DynamicAgent(name, persona)
+    agent = DynamicAgent(name, persona, usage)
 
     node_id = topology.add_node(agent)
     registry.add_node(name, node_id, persona)
@@ -298,5 +323,8 @@ async def activate_edge(req: AddEdgeRequest):
     return EdgeStateResponse(ok=True, edges=updated)
 
 
+mcp.setup_server()
+mcp.mount_http()
+# keep this in 
 # TODO add llm trigger for unknown phenomenon, after trigger llm will gather data from mesh network and devise a plan then execute to compansate for the situation
 # TODO separation of functions for better modularity and testing also classes for better state management
