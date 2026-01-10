@@ -1,9 +1,9 @@
-from typing import Any, Dict, List, Optional, Literal, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
 # -------------------------
 # Registry to export topology
 # -------------------------
-
-
 class TopologyRegistry:
     def __init__(self):
         self.nodes: Dict[str, Dict[str, Any]] = {}
@@ -14,8 +14,20 @@ class TopologyRegistry:
     def export(self) -> Dict[str, Any]:
         return {"nodes": list(self.nodes.values()), "edges": list(self.edges)}
 
-    def add_node(self, name: str, node_id: int, persona: str):
-        self.nodes[name] = {"id": node_id, "name": name, "persona": persona}
+    def add_node(self, name: str, node_id: int, agent: Any):
+        """
+        Store node metadata including concrete Python class identity.
+        `agent` is the actual agent instance.
+        """
+        self.nodes[name] = {
+            "id": node_id,
+            "name": name,
+            "persona": getattr(agent, "persona", ""),
+            "agent_class": agent.__class__.__name__,
+            "agent_module": agent.__class__.__module__,
+            # Optional but handy for catalog-aware UIs/LLMs
+            "agent_type": getattr(agent, "TYPE", None),
+        }
 
     def upsert_edge(self, src: str, dst: str, state: str = "NORMAL") -> bool:
         """
@@ -40,4 +52,3 @@ class TopologyRegistry:
         if key not in self._edge_index:
             return None
         return self.edges[self._edge_index[key]].get("state", "NORMAL")
-
