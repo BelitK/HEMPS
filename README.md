@@ -4,15 +4,15 @@ The project description and a brief template documentation can be found in PROJE
 
 ## Installing
 ```bash
-bash install.sh
+bash setup.sh
 ```
 
 ## Run the template 
 ```bash
 bash run.sh
 
-```
-in another terminal
-``` 
-uv run python_script.py
-```
+## Run streamlit app 
+''' bash
+streamlit run ui.py
+
+## Dont forget to activate .venv
