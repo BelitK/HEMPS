@@ -23,7 +23,7 @@ llm = ChatOllama(model="qwen3:14b", temperature=0.15)
 # - Engage Ragnarok protocol
 
 # Change this based on expected complexity of user requests
-MAX_STEPS = 20
+MAX_STEPS = 40
 
 SYSTEM_INSTRUCTIONS = (
     "You are a conversational assistant controlling a Mango multi-agent system using MCP tools.\n"

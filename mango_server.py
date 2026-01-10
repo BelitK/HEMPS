@@ -6,9 +6,10 @@ from pydantic import BaseModel, Field, ConfigDict, constr
 from fastapi_mcp import FastApiMCP
 
 from mango import Agent, create_topology, activate, create_tcp_container
+from agents.CriticalMonitorAgent import CriticalMonitorAgent
 from agents.dynamic_agent import DynamicAgent, IOAgent, BatteryAgent
 from tools.check_tools import CheckTools
-from agents.TopoRegistry import TopologyRegistry
+from tools.TopoRegistry import TopologyRegistry
 from tools.visualize import visualize_topo
 
 # Try importing Mango State enum for link activation
@@ -159,8 +160,24 @@ async def startup():
     agents_by_name["router"] = router
 
     container.register(router)
+
+    monitor = CriticalMonitorAgent(llm_trigger_url="http://127.0.0.1:9001/llm/trigger")
+    monitor_id = topology.add_node(monitor)
+    registry.add_node("critical_monitor", monitor_id, monitor.persona)
+    agents_by_name["critical_monitor"] = monitor
+    container.register(monitor)
+
+    # optionally connect router -> monitor so it receives traffic
+    topology.add_edge(registry.nodes["router"]["id"], monitor_id)
+    registry.upsert_edge("router", "critical_monitor", state="NORMAL")
+
+    if hasattr(topology, "inject"):
+        topology.inject()
     # first test agent for development, gonna remove before presentation
-    test_agent = IOAgent()
+    test_agent = IOAgent(
+        name="test_agent",
+        persona="A test IO agent for development purposes.",
+    )
     test_agent_id = topology.add_node(test_agent)
     registry.add_node("test_agent", test_agent_id, test_agent.persona)
     agents_by_name["test_agent"] = test_agent

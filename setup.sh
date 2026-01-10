@@ -114,14 +114,16 @@ if [ "$MODEL_CHOICE" = "ask" ]; then
     echo "  1) gemma3:12b (default)"
     echo "  2) llama3:8b"
     echo "  3) nous-hermes2:mistral"
-    echo "  4) Skip model download"
-    read -rp "Enter choice [1-4]: " choice
+    echo "  4) qwen3:14b"
+    echo "  5) Skip model download"
+    read -rp "Enter choice [1-5]: " choice
 
     case "$choice" in
         1|"") MODEL="gemma3:12b" ;;
         2) MODEL="llama3:8b" ;;
         3) MODEL="nous-hermes2:mistral" ;;
-        4) MODEL="none" ;;
+        4) MODEL="qwen3:14b" ;;
+        5) MODEL="none" ;;  
         *) echo "Invalid choice. Skipping model download."; MODEL="none" ;;
     esac
 else
