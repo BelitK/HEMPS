@@ -7,9 +7,12 @@ MANGO_PORT="8000"
 LLM_PORT="9001"
 UI_PORT="${UI_PORT:-8501}"
 
-MANGO_LOG="${MANGO_LOG:-mango_server.log}"
-LLM_LOG="${LLM_LOG:-llm_controller.log}"
-UI_LOG="${UI_LOG:-streamlit_ui.log}"
+LOG_DIR="${LOG_DIR:-logs}"
+mkdir -p "$LOG_DIR"
+
+MANGO_LOG="${MANGO_LOG:-${LOG_DIR}/mango_server.log}"
+LLM_LOG="${LLM_LOG:-${LOG_DIR}/llm_controller.log}"
+UI_LOG="${UI_LOG:-${LOG_DIR}/streamlit_ui.log}"
 
 LOG_LEVEL="debug"
 

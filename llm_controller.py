@@ -21,7 +21,7 @@ from langchain.agents import create_agent
 # Logging
 # -------------------------
 LOG_LEVEL = os.getenv("LLM_LOG_LEVEL", "INFO").upper()
-LOG_FILE = os.getenv("LLM_LOG_FILE", "llm_service.log")
+LOG_FILE = os.getenv("LLM_LOG_FILE", "logs/llm_service.log")
 
 logger = logging.getLogger("llm_service")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
