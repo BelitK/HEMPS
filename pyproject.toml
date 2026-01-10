@@ -18,6 +18,8 @@ dependencies = [
     "pandas>=2.3.3",
     "pip>=25.3",
     "pydantic>=2.12.5",
-    "pyvis>=0.3.2",
+    "streamlit>=1.52.2",
+    "streamlit-agraph>=0.0.45",
+    "streamlit-autorefresh>=1.0.1",
     "uvicorn>=0.38.0",
 ]

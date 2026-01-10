@@ -10,7 +10,6 @@ from agents.CriticalMonitorAgent import CriticalMonitorAgent
 from agents.dynamic_agent import DynamicAgent, IOAgent, BatteryAgent
 from tools.check_tools import CheckTools
 from tools.TopoRegistry import TopologyRegistry
-from tools.visualize import visualize_topo
 
 # Try importing Mango State enum for link activation
 try:
@@ -340,17 +339,6 @@ async def activate_edge(req: AddEdgeRequest):
 
     return EdgeStateResponse(ok=True, edges=updated)
 
-
-@app.get("/visualize")
-async def visualize_topology(background: BackgroundTasks):
-    """
-    Generate and return topology visualization HTML file.
-    """
-    try:
-        background.add_task(visualize_topo)
-    except Exception as e:
-        print(f"Error visualizing topology: {e}")
-    return {"status": "started", "html_file": "mango_topology.html"}
 
 mcp.setup_server()
 mcp.mount_http()
