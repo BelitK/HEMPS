@@ -1,7 +1,7 @@
 from typing import Any, Callable, Dict, List, Optional
 import json
 
-from agents.dynamic_agent import DynamicAgent
+from .dynamic_agent import DynamicAgent
 from mango import sender_addr
 
 
@@ -15,10 +15,18 @@ class IOAgent(DynamicAgent):
     3. Handle incoming commands from Dispatcher and route to appropriate Agents
     """
     
-    def __init__(self, name: str = "io_agent"):
+    # Catalog metadata (required for agent factory & catalog)
+    TYPE = "io"
+    LABEL = "IO Agent"
+    DEFAULT_PERSONA = "Central IO interface that aggregates agent information and routes commands."
+    DEFAULT_USAGE = "Manages data flow between device agents and the dispatcher."
+    CAPABILITIES = ["aggregate", "route", "register", "query"]
+    
+    def __init__(self, name: str = "io_agent", persona: str | None = None, usage: str | None = None):
         super().__init__(
             name=name,
-            persona="Central IO interface that aggregates agent information and routes commands."
+            persona=persona or self.DEFAULT_PERSONA,
+            usage=usage or self.DEFAULT_USAGE
         )
         # Registry of connected agents and their info callbacks
         self.connected_agents: Dict[str, Dict[str, Any]] = {}
