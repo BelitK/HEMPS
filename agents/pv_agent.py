@@ -15,7 +15,7 @@ class PVAgent(DynamicAgent):
     3. Report panel status and efficiency
     """
     
-    # Catalog metadata
+    #Catalog metadata
     TYPE = "pv"
     LABEL = "PV Agent"
     DEFAULT_PERSONA = "Monitors solar panel generation and provides power forecasts."
@@ -28,7 +28,7 @@ class PVAgent(DynamicAgent):
         persona: str | None = None,
         usage: str | None = None,
         peak_capacity_kw: float = 5.0,
-        efficiency: float = 0.85,
+        _efficiency: float = 0.85,
     ):
         super().__init__(
             name=name,
@@ -37,46 +37,65 @@ class PVAgent(DynamicAgent):
         )
         # PV system parameters
         self.peak_capacity_kw = peak_capacity_kw
-        self.efficiency = efficiency
+        self._efficiency = _efficiency
         self.current_output_kw = 0.0
         self.panel_status = "operational"
     
-    def get_current_output(self) -> float:
-        """Get current power output in kW."""
-        return self.current_output_kw
+
+    def generation(self) -> Dict[str, Any]:
+        """Get current power generation."""
+        return {
+            "current_output_kw": self.current_output_kw,
+            "peak_capacity_kw": self.peak_capacity_kw,
+            "utilization_percent": round((self.current_output_kw / self.peak_capacity_kw) * 100, 1) if self.peak_capacity_kw > 0 else 0,
+        }
     
-    def set_current_output(self, output_kw: float):
-        """Set current power output (called by simulation or real sensor)."""
-        self.current_output_kw = min(output_kw, self.peak_capacity_kw)
-    
-    def get_generation_forecast(self, hours: int = 24) -> List[float]:
+    def forecast(self, hours: int = 24) -> Dict[str, Any]:
         """
         Generate a solar power forecast for the next N hours.
         Uses a sinusoidal model peaking at noon.
         """
-        # Solar generation follows daylight - peak at hour 12
         time_values = list(range(hours))
+        forecast_values = []
         
-        # Generate using sinusoidal pattern (peak at noon)
-        forecast = []
         for hour in time_values:
-            # Solar curve: 0 at night, peak at noon
-            # Shift phase so peak is at hour 12
             hour_of_day = hour % 24
             if 6 <= hour_of_day <= 18:  # Daylight hours
-                # Sine wave from 6am to 6pm
                 solar_factor = math.sin(math.pi * (hour_of_day - 6) / 12)
-                output = self.peak_capacity_kw * self.efficiency * solar_factor
+                output = self.peak_capacity_kw * self._efficiency * solar_factor
             else:
                 output = 0.0
-            forecast.append(round(output, 2))
+            forecast_values.append(round(output, 2))
         
-        return forecast
+        return {
+            "hours": hours,
+            "forecast_kw": forecast_values,
+            "total_energy_kwh": round(sum(forecast_values), 2),
+        }
     
-    def get_daily_energy_estimate(self) -> float:
-        """Estimate total daily energy production in kWh."""
-        forecast = self.get_generation_forecast(24)
-        return round(sum(forecast), 2)
+    def status(self) -> Dict[str, Any]:
+        """Get panel status and health."""
+        return {
+            "panel_status": self.panel_status,
+            "current_output_kw": self.current_output_kw,
+            "is_generating": self.current_output_kw > 0,
+        }
+    
+    def efficiency(self) -> Dict[str, Any]:
+        """Get efficiency metrics."""
+        return {
+            "efficiency_percent": round(self._efficiency * 100, 1),
+            "peak_capacity_kw": self.peak_capacity_kw,
+            "effective_capacity_kw": round(self.peak_capacity_kw * self._efficiency, 2),
+        }
+
+
+    # ==========================================
+                # Helper methods 
+    # ==========================================
+    def set_output(self, output_kw: float):
+        """Set current power output (called by simulation or real sensor)."""
+        self.current_output_kw = min(output_kw, self.peak_capacity_kw)
     
     def info(self) -> Dict[str, Any]:
         """Return agent info for LLM/catalog."""
@@ -84,35 +103,42 @@ class PVAgent(DynamicAgent):
         base_info.update({
             "type": self.TYPE,
             "peak_capacity_kw": self.peak_capacity_kw,
-            "efficiency": self.efficiency,
+            "efficiency_percent": round(self._efficiency * 100, 1),
             "current_output_kw": self.current_output_kw,
             "panel_status": self.panel_status,
-            "daily_estimate_kwh": self.get_daily_energy_estimate(),
+            "daily_estimate_kwh": self.forecast(24)["total_energy_kwh"],
         })
         return base_info
     
     def handle_message(self, content, meta):
-        """Handle incoming messages."""
+        """Handle incoming messages by routing to capability methods."""
         c = str(content).lower()
         
-        if "forecast" in c or "predict" in c:
-            forecast = self.get_generation_forecast(24)
-            print(f"[{self.name}] Next 24h forecast (kW): {forecast}")
-            return {"forecast": forecast}
+        if "forecast" in c:
+            result = self.forecast()
+            print(f"[{self.name}] Forecast: {result}")
+            return result
         
-        elif "output" in c or "current" in c or "generation" in c:
-            output = self.get_current_output()
-            print(f"[{self.name}] Current output: {output} kW")
-            return {"current_output_kw": output}
+        elif "generation" in c or "output" in c:
+            result = self.generation()
+            print(f"[{self.name}] Generation: {result}")
+            return result
         
         elif "status" in c:
-            print(f"[{self.name}] Panel status: {self.panel_status}")
-            return {"status": self.panel_status}
+            result = self.status()
+            print(f"[{self.name}] Status: {result}")
+            return result
+        
+        elif "efficiency" in c:
+            result = self.efficiency()
+            print(f"[{self.name}] Efficiency: {result}")
+            return result
         
         elif "info" in c:
-            info = self.info()
-            print(f"[{self.name}] Full info: {info}")
-            return info
+            result = self.info()
+            print(f"[{self.name}] Info: {result}")
+            return result
         
         else:
             super().handle_message(content, meta)
+

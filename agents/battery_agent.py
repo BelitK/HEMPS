@@ -14,7 +14,7 @@ class BatteryAgent(DynamicAgent):
     4. Report battery status and health
     """
     
-    # Catalog metadata
+    #Catalog metadata
     TYPE = "battery"
     LABEL = "Battery Agent"
     DEFAULT_PERSONA = "Manages home battery storage, tracking charge levels and handling energy flow."
@@ -51,36 +51,25 @@ class BatteryAgent(DynamicAgent):
         self.battery_status = "idle"  # idle, charging, discharging
         self.health_percent = 100.0
         self.cycle_count = 0
+        
+        # Schedule storage
+        self._schedule: List[Dict[str, Any]] = []
+
     
-    def get_soc(self) -> float:
-        """Get current State of Charge (0.0 to 1.0)."""
-        return self.current_soc
-    
-    def get_soc_percent(self) -> float:
-        """Get current State of Charge as percentage."""
-        return round(self.current_soc * 100, 1)
-    
-    def get_available_energy_kwh(self) -> float:
-        """Get available energy above minimum SoC."""
-        usable_soc = self.current_soc - self.min_soc
-        return round(max(0, usable_soc * self.capacity_kwh), 2)
-    
-    def get_available_capacity_kwh(self) -> float:
-        """Get remaining capacity below maximum SoC."""
-        headroom_soc = self.max_soc - self.current_soc
-        return round(max(0, headroom_soc * self.capacity_kwh), 2)
-    
-    def charge(self, power_kw: float, duration_hours: float = 1.0) -> Dict[str, Any]:
+    def charge(self, power_kw: float = None, duration_hours: float = 1.0) -> Dict[str, Any]:
         """
         Charge the battery.
         Returns result with actual energy transferred.
         """
+        if power_kw is None:
+            power_kw = self.max_charge_kw
+            
         # Limit to max charge rate
         actual_power = min(power_kw, self.max_charge_kw)
         
         # Calculate energy to add
         energy_kwh = actual_power * duration_hours
-        available_capacity = self.get_available_capacity_kwh()
+        available_capacity = self._get_available_capacity_kwh()
         actual_energy = min(energy_kwh, available_capacity)
         
         # Update SoC
@@ -95,23 +84,27 @@ class BatteryAgent(DynamicAgent):
             "action": "charge",
             "requested_kw": power_kw,
             "actual_kw": actual_power,
+            "duration_hours": duration_hours,
             "energy_added_kwh": round(actual_energy, 2),
-            "new_soc_percent": self.get_soc_percent(),
+            "new_soc_percent": self._get_soc_percent(),
         }
         print(f"[{self.name}] Charged: {result}")
         return result
     
-    def discharge(self, power_kw: float, duration_hours: float = 1.0) -> Dict[str, Any]:
+    def discharge(self, power_kw: float = None, duration_hours: float = 1.0) -> Dict[str, Any]:
         """
         Discharge the battery.
         Returns result with actual energy transferred.
         """
+        if power_kw is None:
+            power_kw = self.max_discharge_kw
+            
         # Limit to max discharge rate
         actual_power = min(power_kw, self.max_discharge_kw)
         
         # Calculate energy to remove
         energy_kwh = actual_power * duration_hours
-        available_energy = self.get_available_energy_kwh()
+        available_energy = self._get_available_energy_kwh()
         actual_energy = min(energy_kwh, available_energy)
         
         # Update SoC
@@ -121,17 +114,73 @@ class BatteryAgent(DynamicAgent):
         # Update state
         self.current_power_kw = -actual_power
         self.battery_status = "discharging" if actual_energy > 0 else "empty"
-        self.cycle_count += actual_energy / self.capacity_kwh  # Partial cycle count
+        self.cycle_count += actual_energy / self.capacity_kwh
         
         result = {
             "action": "discharge",
             "requested_kw": power_kw,
             "actual_kw": actual_power,
+            "duration_hours": duration_hours,
             "energy_delivered_kwh": round(actual_energy, 2),
-            "new_soc_percent": self.get_soc_percent(),
+            "new_soc_percent": self._get_soc_percent(),
         }
         print(f"[{self.name}] Discharged: {result}")
         return result
+    
+    def soc(self) -> Dict[str, Any]:
+        """Get State of Charge information."""
+        return {
+            "soc_percent": self._get_soc_percent(),
+            "soc_raw": round(self.current_soc, 3),
+            "available_energy_kwh": self._get_available_energy_kwh(),
+            "available_capacity_kwh": self._get_available_capacity_kwh(),
+            "capacity_kwh": self.capacity_kwh,
+        }
+    
+    def status(self) -> Dict[str, Any]:
+        """Get battery status and health."""
+        return {
+            "battery_status": self.battery_status,
+            "soc_percent": self._get_soc_percent(),
+            "current_power_kw": self.current_power_kw,
+            "health_percent": self.health_percent,
+            "cycle_count": round(self.cycle_count, 1),
+            "is_charging": self.battery_status == "charging",
+            "is_discharging": self.battery_status == "discharging",
+        }
+    
+    def schedule(self, actions: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Get or set the battery schedule.
+        If actions provided, sets the schedule.
+        Returns current schedule.
+        """
+        if actions is not None:
+            self._schedule = actions
+            print(f"[{self.name}] Schedule set: {len(actions)} actions")
+        
+        return {
+            "schedule": self._schedule,
+            "schedule_count": len(self._schedule),
+        }
+    
+    # ==========================================
+               # Helper methods 
+    # ==========================================
+    
+    def _get_soc_percent(self) -> float:
+        """Get current State of Charge as percentage."""
+        return round(self.current_soc * 100, 1)
+    
+    def _get_available_energy_kwh(self) -> float:
+        """Get available energy above minimum SoC."""
+        usable_soc = self.current_soc - self.min_soc
+        return round(max(0, usable_soc * self.capacity_kwh), 2)
+    
+    def _get_available_capacity_kwh(self) -> float:
+        """Get remaining capacity below maximum SoC."""
+        headroom_soc = self.max_soc - self.current_soc
+        return round(max(0, headroom_soc * self.capacity_kwh), 2)
     
     def stop(self) -> Dict[str, Any]:
         """Stop charging/discharging."""
@@ -145,9 +194,9 @@ class BatteryAgent(DynamicAgent):
         base_info.update({
             "type": self.TYPE,
             "capacity_kwh": self.capacity_kwh,
-            "soc_percent": self.get_soc_percent(),
-            "available_energy_kwh": self.get_available_energy_kwh(),
-            "available_capacity_kwh": self.get_available_capacity_kwh(),
+            "soc_percent": self._get_soc_percent(),
+            "available_energy_kwh": self._get_available_energy_kwh(),
+            "available_capacity_kwh": self._get_available_capacity_kwh(),
             "current_power_kw": self.current_power_kw,
             "battery_status": self.battery_status,
             "health_percent": self.health_percent,
@@ -162,28 +211,40 @@ class BatteryAgent(DynamicAgent):
         return base_info
     
     def handle_message(self, content, meta):
-        """Handle incoming messages."""
+        """Handle incoming messages by routing to capability methods."""
         c = str(content).lower()
         
         if "charge" in c and "discharge" not in c:
-            # Extract power if specified, default to max
-            return self.charge(self.max_charge_kw)
+            result = self.charge()
+            return result
         
         elif "discharge" in c:
-            return self.discharge(self.max_discharge_kw)
+            result = self.discharge()
+            return result
+        
+        elif "soc" in c or "level" in c:
+            result = self.soc()
+            print(f"[{self.name}] SoC: {result}")
+            return result
+        
+        elif "status" in c:
+            result = self.status()
+            print(f"[{self.name}] Status: {result}")
+            return result
+        
+        elif "schedule" in c:
+            result = self.schedule()
+            print(f"[{self.name}] Schedule: {result}")
+            return result
         
         elif "stop" in c or "idle" in c:
             return self.stop()
         
-        elif "soc" in c or "level" in c or "percent" in c:
-            soc = self.get_soc_percent()
-            print(f"[{self.name}] Current SoC: {soc}%")
-            return {"soc_percent": soc}
-        
-        elif "status" in c or "info" in c:
-            info = self.info()
-            print(f"[{self.name}] Status: {info}")
-            return info
+        elif "info" in c:
+            result = self.info()
+            print(f"[{self.name}] Info: {result}")
+            return result
         
         else:
             super().handle_message(content, meta)
+
