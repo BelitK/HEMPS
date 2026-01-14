@@ -1,8 +1,7 @@
 from typing import Any, Dict, List, Optional
-import math
 
 from .dynamic_agent import DynamicAgent
-from .forecasters import sinusoidal_prices  # Reuse for solar curve simulation
+from .forecasters import solar_forecast
 
 
 class PVAgent(DynamicAgent):
@@ -11,11 +10,13 @@ class PVAgent(DynamicAgent):
     
     Responsibilities:
     1. Track current power generation
-    2. Provide generation forecasts
+    2. Provide generation forecasts (via forecasters module)
     3. Report panel status and efficiency
+    
+    CAPABILITIES match method names for LLM invocation.
     """
     
-    #Catalog metadata
+    # Catalog metadata
     TYPE = "pv"
     LABEL = "PV Agent"
     DEFAULT_PERSONA = "Monitors solar panel generation and provides power forecasts."
@@ -28,7 +29,7 @@ class PVAgent(DynamicAgent):
         persona: str | None = None,
         usage: str | None = None,
         peak_capacity_kw: float = 5.0,
-        _efficiency: float = 0.85,
+        efficiency: float = 0.85,
     ):
         super().__init__(
             name=name,
@@ -37,11 +38,14 @@ class PVAgent(DynamicAgent):
         )
         # PV system parameters
         self.peak_capacity_kw = peak_capacity_kw
-        self._efficiency = _efficiency
+        self._efficiency = efficiency
         self.current_output_kw = 0.0
         self.panel_status = "operational"
     
-
+    # ==========================================
+    # CAPABILITY METHODS (match CAPABILITIES list)
+    # ==========================================
+    
     def generation(self) -> Dict[str, Any]:
         """Get current power generation."""
         return {
@@ -52,26 +56,16 @@ class PVAgent(DynamicAgent):
     
     def forecast(self, hours: int = 24) -> Dict[str, Any]:
         """
-        Generate a solar power forecast for the next N hours.
-        Uses a sinusoidal model peaking at noon.
+        Generate a solar power forecast using the forecasters module.
+        Delegates to solar_forecast() with this agent's parameters.
         """
-        time_values = list(range(hours))
-        forecast_values = []
-        
-        for hour in time_values:
-            hour_of_day = hour % 24
-            if 6 <= hour_of_day <= 18:  # Daylight hours
-                solar_factor = math.sin(math.pi * (hour_of_day - 6) / 12)
-                output = self.peak_capacity_kw * self._efficiency * solar_factor
-            else:
-                output = 0.0
-            forecast_values.append(round(output, 2))
-        
-        return {
-            "hours": hours,
-            "forecast_kw": forecast_values,
-            "total_energy_kwh": round(sum(forecast_values), 2),
-        }
+        # Use the centralized forecaster function
+        result = solar_forecast(
+            hours=hours,
+            peak_capacity_kw=self.peak_capacity_kw,
+            efficiency=self._efficiency,
+        )
+        return result
     
     def status(self) -> Dict[str, Any]:
         """Get panel status and health."""
