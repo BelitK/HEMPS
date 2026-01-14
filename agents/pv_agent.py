@@ -7,14 +7,14 @@ from .forecasters import sinusoidal_prices  # Reuse for solar curve simulation
 
 class PVAgent(DynamicAgent):
     """
-    PV Agent - Manages the Photovoltaic (Solar Panel) system.
+    PV Agent - Manages the Photovoltaic (PV) system.
     
     Responsibilities:
     1. Track current power generation
-    2. Provide generation forecasts
+    2. Provide generation forecasts     
     3. Report panel status and efficiency
     """
-    
+    # J: i think the forecast-agent should do the forecasting for PV and demand
     # Catalog metadata
     TYPE = "pv"
     LABEL = "PV Agent"
@@ -37,7 +37,7 @@ class PVAgent(DynamicAgent):
         )
         # PV system parameters
         self.peak_capacity_kw = peak_capacity_kw
-        self.efficiency = efficiency
+        self.efficiency = efficiency        
         self.current_output_kw = 0.0
         self.panel_status = "operational"
     

@@ -17,7 +17,7 @@ class BatteryAgent(DynamicAgent):
     # Catalog metadata
     TYPE = "battery"
     LABEL = "Battery Agent"
-    DEFAULT_PERSONA = "Manages home battery storage, tracking charge levels and handling energy flow."
+    DEFAULT_PERSONA = "Manages home battery storage, tracks charge levels and handles energy flow."
     DEFAULT_USAGE = "Responds to charge/discharge commands and reports energy storage status."
     CAPABILITIES = ["charge", "discharge", "soc", "status", "schedule"]
     
@@ -65,7 +65,7 @@ class BatteryAgent(DynamicAgent):
         usable_soc = self.current_soc - self.min_soc
         return round(max(0, usable_soc * self.capacity_kwh), 2)
     
-    def get_available_capacity_kwh(self) -> float:
+    def get_available_capacity_kwh(self) -> float:     
         """Get remaining capacity below maximum SoC."""
         headroom_soc = self.max_soc - self.current_soc
         return round(max(0, headroom_soc * self.capacity_kwh), 2)
