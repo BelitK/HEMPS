@@ -91,3 +91,22 @@ class GridAgent(DynamicAgent):
             print(f"[{self.name}] Next 24-hour price forecast: {forecast}")
         else:
             super().handle_message(content, meta)
+
+if __name__ == "__main__":
+    # Simple test
+    agents = [
+        IOAgent(name="io_agent"),
+        BatteryAgent(name="battery_agent"),
+        GridAgent(name="grid_agent"),
+    ]
+
+    test_messages = [
+        ("Input data received", {}),
+        ("What is the battery status?", {}),
+        ("Provide price forecast", {}),
+        ("This is a critical alert!", {}),
+    ]
+
+    for agent in agents:
+        for msg, meta in test_messages:
+            agent.handle_message(msg, meta)

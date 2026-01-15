@@ -327,3 +327,8 @@ async def activate_edge(req: AddEdgeRequest):
 
 mcp.setup_server()
 mcp.mount_http()
+
+## add function for agent message sending, querying, etc.
+## update topology function to include agent states and more details
+## add function to interact with io agent functions
+
