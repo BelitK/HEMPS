@@ -8,7 +8,11 @@ from fastapi_mcp import FastApiMCP
 from mango import Agent, create_topology, activate, create_tcp_container
 
 from agents.CriticalMonitorAgent import CriticalMonitorAgent
-from agents.dynamic_agent import DynamicAgent, IOAgent
+from agents.dynamic_agent import DynamicAgent
+from agents.io_agent import IOAgent
+from agents.pv_agent import PVAgent
+from agents.battery_agent import BatteryAgent
+from agents.grid_agent import GridAgent
 from agents.agent_catalog import generate_agent_catalog
 
 from tools.check_tools import CheckTools

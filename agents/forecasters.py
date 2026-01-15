@@ -66,43 +66,121 @@ def load_timeseries_csv(
     }
 
 
-def load_household_data(filepath: str = None) -> Dict[str, Any]:
+def load_household_data(
+    filepath: str = None,
+    household: str = None,
+    start_row: int = 0,
+    num_hours: int = None,
+) -> Dict[str, Any]:
     """
     Load household energy data from CSV.
     
-    Expected columns: timestamp, load_kw, pv_generation_kw, grid_price_cents, temperature_c
+    Supports two dataset formats:
+    1. Simple format (sample data): timestamp, load_kw, pv_generation_kw, grid_price_cents, temperature_c
+    2. German dataset: Multiple households with columns like DE_KN_residential3_grid_import, DE_KN_residential3_pv
     
     Args:
         filepath: Path to CSV (defaults to sample data)
+        household: For real dataset, specify household (e.g., 'residential3', 'residential4')
+        start_row: Starting row index (for selecting time period)
+        num_hours: Number of hours to load (None = all data)
     
     Returns:
-        Structured forecast-like dict
+        Structured forecast-like dict with load, PV, grid import/export data
     """
     if filepath is None:
         # Default to sample data in project
         base_dir = Path(__file__).parent.parent
         filepath = str(base_dir / "data" / "sample_household_24h.csv")
     
-    raw = load_timeseries_csv(filepath)
-    data = raw["data"]
+    # Determine if this is the real German dataset
+    is_german_dataset = "household_data_60min" in filepath or household is not None
     
-    return {
-        "type": "household_data",
-        "source": filepath,
-        "hours": raw["hours"],
-        "load_kw": data.get("load_kw", []),
-        "pv_generation_kw": data.get("pv_generation_kw", []),
-        "grid_price_cents": data.get("grid_price_cents", []),
-        "temperature_c": data.get("temperature_c", []),
-        "timestamps": data.get("timestamp", []),
-        "summary": {
-            "total_load_kwh": round(sum(data.get("load_kw", [])), 2),
-            "total_pv_kwh": round(sum(data.get("pv_generation_kw", [])), 2),
-            "avg_price": round(sum(data.get("grid_price_cents", [])) / max(1, len(data.get("grid_price_cents", []))), 2),
-            "peak_load_kw": max(data.get("load_kw", [0])),
-            "peak_pv_kw": max(data.get("pv_generation_kw", [0])),
-        },
-    }
+    if is_german_dataset:
+        # Load real German dataset with pandas for better handling
+        import pandas as pd
+        
+        # Determine which household to load
+        if household is None:
+            household = "residential3"  # Default to residential3 (has good data coverage)
+        
+        # Load data
+        df = pd.read_csv(filepath, skiprows=range(1, start_row + 1) if start_row > 0 else None, nrows=num_hours)
+        
+        # Build column prefix
+        prefix = f"DE_KN_{household}_"
+        
+        # Extract relevant columns
+        timestamps = df["cet_cest_timestamp"].tolist() if "cet_cest_timestamp" in df.columns else []
+        
+        # Grid import/export
+        grid_import = df.get(f"{prefix}grid_import", pd.Series([0.0] * len(df))).fillna(0.0).tolist()
+        grid_export = df.get(f"{prefix}grid_export", pd.Series([0.0] * len(df))).fillna(0.0).tolist()
+        
+        # PV generation (try multiple column patterns)
+        pv_cols = [col for col in df.columns if prefix in col and "pv" in col]
+        if pv_cols:
+            pv_generation = df[pv_cols].fillna(0.0).sum(axis=1).tolist()
+        else:
+            pv_generation = [0.0] * len(df)
+        
+        # Calculate total load from grid_import (approximation)
+        # In reality: load ≈ grid_import + pv_generation - grid_export
+        load_kw = [(grid_import[i] + pv_generation[i] - grid_export[i]) for i in range(len(grid_import))]
+        
+        # Get appliance-level data if available
+        appliances = {}
+        for col in df.columns:
+            if prefix in col and col not in [f"{prefix}grid_import", f"{prefix}grid_export"] and "pv" not in col:
+                appliance_name = col.replace(prefix, "")
+                appliances[appliance_name] = df[col].fillna(0.0).tolist()
+        
+        hours = len(df)
+        
+        return {
+            "type": "household_data_real",
+            "source": filepath,
+            "household": household,
+            "hours": hours,
+            "timestamps": timestamps,
+            "load_kw": load_kw,
+            "pv_generation_kw": pv_generation,
+            "grid_import_kw": grid_import,
+            "grid_export_kw": grid_export,
+            "appliances": appliances,
+            "summary": {
+                "total_load_kwh": round(sum(load_kw), 2),
+                "total_pv_kwh": round(sum(pv_generation), 2),
+                "total_import_kwh": round(sum(grid_import), 2),
+                "total_export_kwh": round(sum(grid_export), 2),
+                "peak_load_kw": round(max(load_kw) if load_kw else 0, 2),
+                "peak_pv_kw": round(max(pv_generation) if pv_generation else 0, 2),
+                "num_appliances": len(appliances),
+            },
+        }
+    
+    else:
+        # Load simple format (sample data)
+        raw = load_timeseries_csv(filepath)
+        data = raw["data"]
+        
+        return {
+            "type": "household_data_sample",
+            "source": filepath,
+            "hours": raw["hours"],
+            "load_kw": data.get("load_kw", []),
+            "pv_generation_kw": data.get("pv_generation_kw", []),
+            "grid_price_cents": data.get("grid_price_cents", []),
+            "temperature_c": data.get("temperature_c", []),
+            "timestamps": data.get("timestamp", []),
+            "summary": {
+                "total_load_kwh": round(sum(data.get("load_kw", [])), 2),
+                "total_pv_kwh": round(sum(data.get("pv_generation_kw", [])), 2),
+                "avg_price": round(sum(data.get("grid_price_cents", [])) / max(1, len(data.get("grid_price_cents", []))), 2),
+                "peak_load_kw": max(data.get("load_kw", [0])),
+                "peak_pv_kw": max(data.get("pv_generation_kw", [0])),
+            },
+        }
 
 
 # ==========================================
