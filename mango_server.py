@@ -1,6 +1,13 @@
 import re
 from typing import Any, Dict, List, Optional, Literal
 
+
+import time
+from typing import Callable
+
+import tools.scheduler as scheduler
+from tools.scheduler import InMemoryScheduler, ScheduleItem  # adjust path/module name
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, constr
 from fastapi_mcp import FastApiMCP
@@ -8,7 +15,8 @@ from fastapi_mcp import FastApiMCP
 from mango import Agent, create_topology, activate, create_tcp_container
 
 from agents.CriticalMonitorAgent import CriticalMonitorAgent
-from agents.dynamic_agent import DynamicAgent, IOAgent
+from agents.dynamic_agent import DynamicAgent
+from agents.io_agent import IOAgent
 from agents.agent_catalog import generate_agent_catalog
 
 from tools.check_tools import CheckTools
@@ -20,6 +28,47 @@ try:
     from mango.agent.core import State
 except Exception:
     State = None
+
+# -------------------------
+# Scheduler
+# -------------------------
+
+
+scheduler = InMemoryScheduler()
+
+async def run_agent_action(agent_name: str, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Default action runner:
+      1) find agent by name
+      2) call agent.<action>(**payload) if exists
+      3) else call agent.run_action(action, payload) if exists
+    """
+    _require_agent(agent_name)
+    agent = agents_by_name[agent_name]
+
+    # 1) direct method call: agent.<action>(**payload)
+    fn = getattr(agent, action, None)
+    if callable(fn):
+        try:
+            res = fn(**(payload or {}))
+            # may be coroutine or normal value
+            if hasattr(res, "__await__"):
+                res = await res
+            return res if isinstance(res, dict) else {"result": res}
+        except TypeError as e:
+            # common: wrong kwargs
+            raise RuntimeError(f"action '{action}' called with invalid payload: {e}") from e
+
+    # 2) generic handler: agent.run_action(action, payload)
+    fn2 = getattr(agent, "run_action", None)
+    if callable(fn2):
+        res = fn2(action, payload or {})
+        if hasattr(res, "__await__"):
+            res = await res
+        return res if isinstance(res, dict) else {"result": res}
+
+    raise RuntimeError(f"agent '{agent_name}' has no action '{action}' and no run_action handler")
+
 
 
 # -------------------------
@@ -64,8 +113,19 @@ class CreateAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: AgentName
-    agent_type: str
-    state: Literal["NORMAL", "INACTIVE", "BROKEN"]
+    agent_type: str = Field(default="stock", description="Type of agent to create. Agent type must be selected from the catalog-derived set (fixed at startup).\n"
+                            "Choose exactly one. Do not invent new values choose from the agent catalog.\n"
+                            "Don't use 'dynamic' as agent_type.")
+
+    state: Literal["NORMAL", "INACTIVE", "BROKEN"] = Field(default="NORMAL",
+                                                               description=(
+        "Operational state of the agent. "
+        "Must be exactly one of: NORMAL, INACTIVE, BROKEN. "
+        "NORMAL = agent is active and functioning. "
+        "INACTIVE = agent exists but should not run. "
+        "BROKEN = agent is faulty and should not be used. "
+        "No other values are allowed."
+    ))
 
     persona: Optional[str] = Field(default=None, max_length=240)
     usage: Optional[str] = Field(default=None, max_length=240)
@@ -97,6 +157,40 @@ class AddEdgeResponse(BaseModel):
 class EdgeStateResponse(BaseModel):
     ok: bool
     edges: List[Dict[str, Any]]
+
+class ScheduleCreateRequest(BaseModel):
+    created_by: str = Field(..., min_length=1)
+    run_at_epoch: float = Field(..., description="Unix epoch seconds")
+    agent_name: AgentName
+    action: str = Field(..., min_length=1)
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+class ScheduleResponse(BaseModel):
+    id: str
+    created_at: float
+    created_by: str
+    status: str
+    run_at: float
+    agent_name: str
+    action: str
+    payload: Dict[str, Any]
+    error: Optional[str] = None
+    result: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def from_item(x: ScheduleItem) -> "ScheduleResponse":
+        return ScheduleResponse(
+            id=x.id,
+            created_at=x.created_at,
+            created_by=x.created_by,
+            status=x.status,
+            run_at=x.run_at,
+            agent_name=x.agent_name,
+            action=x.action,
+            payload=x.payload,
+            error=x.error,
+            result=x.result,
+        )
 
 
 # -------------------------
@@ -184,13 +278,14 @@ async def startup():
 
     # Test IO agent
     test_agent = IOAgent(
-        name="test_agent",
+        name="io_agent",
         persona="A test IO agent for development purposes.",
     )
     test_agent_id = topology.add_node(test_agent)
-    registry.add_node("test_agent", test_agent_id, test_agent)
-    agents_by_name["test_agent"] = test_agent
+    registry.add_node("io_agent", test_agent_id, test_agent)
+    agents_by_name["io_agent"] = test_agent
     container.register(test_agent)
+    registry.upsert_edge("io_agent", "router",  state="NORMAL")
 
     if hasattr(topology, "inject"):
         topology.inject()
@@ -198,9 +293,14 @@ async def startup():
     activation_manager = activate(container)
     await activation_manager.__aenter__()
 
+    scheduler.set_action_runner(run_agent_action)
+    await scheduler.start(poll_s=0.5)
+
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    await scheduler.stop()
     if activation_manager:
         await activation_manager.__aexit__(None, None, None)
     if topology_ctx:
@@ -325,10 +425,73 @@ async def activate_edge(req: AddEdgeRequest):
     return EdgeStateResponse(ok=True, edges=[{"from": req.src, "to": req.dst, "state": "NORMAL"}])
 
 
+@app.post("/schedules", response_model=ScheduleResponse)
+async def create_schedule(req: ScheduleCreateRequest):
+    _require_agent(req.agent_name)
+    ## time grace for when model calls this tool
+    GRACE_T= 600000
+
+    # optional: reject scheduling too far in the past
+    if req.run_at_epoch < time.time() - GRACE_T:
+        raise HTTPException(status_code=400, detail="run_at_epoch is in the past")
+
+    item = await scheduler.create(
+        created_by=req.created_by,
+        run_at_epoch=req.run_at_epoch,
+        agent_name=req.agent_name,
+        action=req.action,
+        payload=req.payload,
+    )
+    return ScheduleResponse.from_item(item)
+
+
+@app.get("/schedules", response_model=List[ScheduleResponse])
+async def list_schedules(status: Optional[str] = None):
+    items = await scheduler.list(status=status)
+    return [ScheduleResponse.from_item(x) for x in items]
+
+
+@app.get("/schedules/{schedule_id}", response_model=ScheduleResponse)
+async def get_schedule(schedule_id: str):
+    item = await scheduler.get(schedule_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="schedule not found")
+    return ScheduleResponse.from_item(item)
+
+
+@app.post("/schedules/{schedule_id}/cancel")
+async def cancel_schedule(schedule_id: str):
+    ok = await scheduler.cancel(schedule_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail="cannot cancel (not found or already finished)")
+    return {"cancelled": True, "id": schedule_id}
+
+@app.get("/io/status")
+async def io_status():
+    io_agent = agents_by_name.get("io_agent")
+    if not io_agent or not isinstance(io_agent, IOAgent):
+        raise HTTPException(status_code=500, detail="IOAgent 'io_agent' not found")
+
+    info = io_agent.get_aggregated_info()
+    return info
+
 mcp.setup_server()
 mcp.mount_http()
+
+@app.get("/io/forecast")
+async def io_forecast():
+    io_agent = agents_by_name.get("io_agent")
+    if not io_agent or not isinstance(io_agent, IOAgent):
+        raise HTTPException(status_code=500, detail="io_agent 'test_agent' not found")
+
+    info = io_agent.to_llm_format()
+    return info
+
+
+
 
 ## add function for agent message sending, querying, etc.
 ## update topology function to include agent states and more details
 ## add function to interact with io agent functions
+## add io agent to startup sequence
 

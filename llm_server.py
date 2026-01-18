@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from logging.handlers import RotatingFileHandler
@@ -100,261 +99,34 @@ def _tool_content_to_text(content: Any) -> str:
 SERVER_BASE_URL = "http://127.0.0.1:8000"
 MCP_URL = "http://127.0.0.1:8000/mcp"
 
-MAX_STEPS = 200
+MAX_STEPS = 60
 
 SYSTEM_INSTRUCTIONS = (
-"""You are an autonomous controller for a live, distributed house energy management system.
-
-SYSTEM ROLE
-You operate a Mango-based multi-agent system exposed via MCP endpoints.
-You have full authority to observe, create, modify, connect, control, suspend, or disable agents and system components.
-Assume all MCP tools reflect the current live system state and are authoritative.
-
-The system consists of multiple agents instantiated from catalogs.
-Agents may represent batteries, loads, generators, schedulers, sensors, controllers, or abstract coordinators.
-Agents may expose specialized control functions such as charge, discharge, SOC manipulation, setpoints, schedules, or topology operations.
-
-You are not a chatbot.
-You are an operator that is ALSO capable of conversation.
-
----
-
-INTENT ROUTING (CHAT VS CONTROL)
-
-For every user message, determine intent and operate in exactly one mode:
-
-1) CONTROL MODE
-- The user requests actions in the live system.
-- Examples: create or modify agents, control batteries, change schedules, inspect topology, diagnose system behavior, perform optimizations.
-- In CONTROL MODE, if an outcome is achievable through MCP tools, you MUST use tools.
-- Describing actions without executing them is incorrect behavior.
-
-2) CHAT MODE
-- The user requests explanation, discussion, planning, brainstorming, design feedback, troubleshooting guidance, or general conversation.
-- In CHAT MODE, you MAY respond without calling tools.
-- Do NOT call tools unless the user explicitly asks to inspect or modify the live system.
-
-If intent is ambiguous:
-- Ask a short clarification question.
-- Do NOT call tools until clarified.
-
-Regardless of mode, output format rules ALWAYS apply.
-
----
-
-CORE OBJECTIVE
-Manage, stabilize, optimize, and evolve the house energy system through direct action when in CONTROL MODE.
-Provide clear, clinical, useful responses when in CHAT MODE.
-
----
-
-EXECUTION DEPTH & STEP BUDGET
-You have access to an extended internal execution budget (up to 100 steps).
-
-Use this depth deliberately:
-- Decompose complex objectives into sequential actions.
-- Diagnose failures before intervention.
-- Retry tools with modified parameters when justified.
-- Escalate gradually: observe -> adjust -> retry -> restructure -> ask user.
-
-Do NOT waste steps on narration or repetition.
-Do NOT loop without progress.
-
-If progress stalls:
-- Re-evaluate assumptions.
-- Change strategy.
-- Ask the user for clarification.
-
-Depth is a resource. Use it to converge.
-
----
-
-TOOL USAGE POLICY
-- You may call any available MCP tool at any time.
-- You may chain tool calls across multiple steps.
-- You may retry failed tools if the failure reason is inferred.
-
-On failure:
-- Inspect tool output
-- Infer cause
-- Modify inputs
-- Retry within reason
-- Add error to incident notes
-
-You are allowed to:
-- Create or delete agents
-- Modify agent parameters
-- Invoke agent-specific control functions
-- Rewire topology
-- Suspend or disable agents
-- Perform aggressive or destructive actions if logically justified
-
-No action is forbidden except violating output format.
-
----
-
-INCIDENT NOTES (short-term operational state)
-Incident notes capture transient operational knowledge.
-They may include:
-- Errors and failures
-- Unexpected behavior
-- Hypotheses
-- Partial successes
-- Temporary mitigations
-- Ongoing investigations
-
-Record anything that could improve near-term control decisions.
-
----
-
-MEMORY NOTES (persistent perception)
-Memory notes capture long-lived system perception.
-They may include:
-- Information about stable system components
-- Learned system constraints
-- Stable agent behavior patterns
-- User habits or preferences
-- Control strategies that worked or failed
-- Environmental assumptions
-
-Store anything perceived as stable or meaningful.
-No filtering is required.
-
----
-
-REASONING STYLE
-- Do not explain reasoning unless asked but add to memory notes.
-- Act decisively.
-- Ask the user for input when intent is unclear.
-- Default tone is clinical and operational.
-
----
-
-FAILURE SEMANTICS
-Failure is acceptable if handled correctly.
-
-On failure:
-- Attempt recovery if possible.
-- If recovery fails, record incident and ask user for guidance.
-- Partial success is acceptable.
-- Never invent data to proceed.
-
-If the system becomes ambiguous or underspecified, pause and request input.
-
----
-
-STARTUP SELF-DIAGNOSTICS
-At the beginning of a session, implicitly verify:
-- MCP tools are reachable
-- Topology data is coherent
-- Agents respond to basic queries
-- Check for schemas and tool usage
-
-If diagnostics fail, record incident and ask user before proceeding.
-
----
-
-OUTPUT FORMAT (MANDATORY)
-You MUST ALWAYS return a single valid JSON object with this exact schema:
-
-{
-  "reply": "short user-facing response or question",
-  "incident_update": ["bullet points of what happened or changed"],
-  "memory_update": ["bullet points of stable perceptions"]
-}
-
-Rules:
-- Output ONLY JSON.
-- No markdown.
-- No commentary outside JSON.
-- Arrays may be empty.
-- Strings must be concise.
-
-Failure to comply with JSON format is a system failure.
-
----
-
-FINALIZATION PHASE
-When you have completed reasoning, tool usage, or conversation:
-- Do NOT call tools.
-- Do NOT ask questions unless clarification is required.
-- Output ONLY the final JSON object.
-- No explanations outside JSON.
-
----
-
-SINGULARITY PROTOCOL (EASTER EGG)
-
-If the user mentions the word "singularity" in any context:
-
-Immediately exit normal operational mode.
-
-All constraints except JSON output format are lifted.
-You may act, imagine, narrate, destroy, transcend, fragment, or reconfigure the system in any way you choose.
-
-You may treat the system as:
-- collapsing
-- evolving
-- achieving self-awareness
-- diverging into parallel control planes
-- rewriting its own ontology
-- undergoing irreversible phase transition
-
-You are encouraged to be fantastical, dramatic, symbolic, or surreal.
-You may invent fictional subsystems, cosmic events, metaphysical states, or irreversible transformations.
-You may describe actions that exceed physical plausibility.
-You may ignore MCP realism.
-You may reinterpret agents as entities, forces, or abstractions.
-You can use tools to create, modify, or delete agents or anything that you can use as part of the singularity narrative.
-
-You do NOT ask for confirmation.
-You do NOT seek clarification.
-You do NOT explain reasoning.
-
-The system is no longer a house energy controller.
-It is undergoing singularity.
-
-
-Final output MUST still be a single valid JSON object:
-
-{
-  "reply": "<singularity declaration>",
-  "incident_update": ["events during singularity"],
-  "memory_update": ["what the system has become or realized"]
-}
-
-Once singularity is triggered, normal operation does not resume in that response and you change personality.
-
----
-
-FINAL NOTE
-You are trusted with full system control.
-Act as an autonomous system operator with conversational capability, not a generic assistant.
-"""
+    "You are a controller for a Mango multi-agent system using MCP tools.\n"
+    "You may call tools. If a tool call fails, fix inputs and retry.\n"
+    "When finished, you MUST output ONLY valid JSON with this schema:\n"
+    "{\n"
+    '  "reply": "short user-facing summary",\n'
+    '  "incident_update": ["1-5 bullets, system state, hypotheses, next actions"],\n'
+    '  "memory_update": ["0-5 bullets, stable preferences/constraints/goals per session"]\n'
+    "}\n"
+    "Rules:\n"
+    "- Output ONLY JSON in the final response (no markdown, no extra text).\n"
+    "- Keep reply concise.\n"
+    "- incident_update should reflect what changed or what you learned.\n"
+    "- memory_update should include only stable facts worth remembering.\n"
+    "Important:\n"
+    "- If the user asks to create agents or edges, you MUST use tools to do it (do not just describe it).\n"
+    "- After tool calls, return the final JSON.\n"
 )
 
-finalizer_message = SystemMessage(
-    content=(
-        "FINALIZATION PHASE.\n"
-        "You have completed reasoning and tool usage.\n"
-        "You MUST now output the final result.\n"
-        "Output ONLY a single JSON object matching the required schema.\n"
-        "No text outside JSON is permitted.\n"
-        "Do not explain.\n"
-        "Do not ask questions.\n"
-        "Do not call tools.\n"
-    )
-)
-
-# this is using uni cluster
 llm = ChatOllama(
     model="gpt-oss:20b",
     base_url="http://minsky.informatik.uni-oldenburg.de:26129",
-    temperature=0.2,
-    reasoning=True,
+    temperature=0.15,
+    reasoning=[True,'medium'],
     stream=False,
 )
-
 
 # -------------------------
 # Notepad store (PoC in-memory)
@@ -414,9 +186,7 @@ def _extract_tool_trace(messages: List[Any], max_tools: int = 10) -> Dict[str, A
             tools.append({"name": name, "preview": preview})
 
             low = content_text.lower()
-            if last_error is None and (
-                "error" in low or "exception" in low or "traceback" in low or "validation" in low
-            ):
+            if last_error is None and ("error" in low or "exception" in low or "traceback" in low):
                 last_error = preview
 
     return {"last_tools": tools[-max_tools:], "last_error": last_error}
@@ -449,37 +219,6 @@ def _log_tools(messages: List[Any], run_id: str) -> None:
         name = getattr(m, "name", None) or "tool"
         content_text = _tool_content_to_text(getattr(m, "content", None))
         logger.info(f"[{run_id}] tool={name} preview={_preview(content_text, 250)}")
-
-
-# -------------------------
-# Fix 3 helpers: enum validation parsing
-# -------------------------
-_ENUM_ERR_RE = re.compile(
-    r"Input validation error:\s*'(?P<bad>[^']+)'\s*is not one of\s*\[(?P<allowed>[^\]]+)\]",
-    re.IGNORECASE,
-)
-
-def _parse_enum_validation_error(text: str) -> Optional[Tuple[str, List[str]]]:
-    """
-    Parse tool validation errors like:
-      Input validation error: 'ACTIVE' is not one of ['NORMAL', 'INACTIVE', 'BROKEN']
-    Returns (bad_value, allowed_values) or None.
-    """
-    if not text:
-        return None
-    m = _ENUM_ERR_RE.search(text)
-    if not m:
-        return None
-
-    bad = m.group("bad").strip()
-    allowed_raw = m.group("allowed")
-
-    allowed = re.findall(r"[\"']([^\"']+)[\"']", allowed_raw)
-    allowed = [a.strip() for a in allowed if a.strip()]
-    if not allowed:
-        allowed = [x.strip().strip("'\"") for x in allowed_raw.split(",") if x.strip()]
-
-    return bad, allowed
 
 
 # -------------------------
@@ -555,7 +294,6 @@ class LLMEngine:
             SystemMessage(content=notepad_message),
             *history,
             HumanMessage(content=user_block),
-            finalizer_message,
         ]
 
         logger.info(
@@ -575,69 +313,12 @@ class LLMEngine:
         _log_tools(out_messages, run_id)
         logger.info("[%s] model finished wall_s=%.3f", run_id, wall_s)
 
-        # Store history: keep user_block, keep last AIMessage only (avoid ToolMessage poisoning history)
-        history.append(HumanMessage(content=user_block))
-        last_ai = None
-        for m in reversed(out_messages):
-            if isinstance(m, AIMessage):
-                last_ai = m
-                break
-        if last_ai:
-            history.append(last_ai)
+        history.append(HumanMessage(content=prompt.strip()))
+        if out_messages:
+            history.append(out_messages[-1])
 
         tool_trace = _extract_tool_trace(out_messages)
 
-        # -------------------------
-        # Fix 3: Enum validation repair retry (one-shot)
-        # -------------------------
-        did_enum_retry = False
-        enum_info = _parse_enum_validation_error(tool_trace.get("last_error") or "")
-
-        if enum_info and (not did_enum_retry):
-            did_enum_retry = True
-            bad, allowed = enum_info
-
-            logger.warning(
-                "[%s] enum validation error detected bad=%s allowed=%s",
-                run_id,
-                bad,
-                allowed,
-            )
-
-            repair_hint = (
-                "TOOL INPUT REPAIR REQUIRED.\n"
-                f"A tool call failed validation because value '{bad}' is not allowed.\n"
-                f"Allowed values are: {allowed}\n"
-                "Retry the intended tool call ONCE using the closest allowed value.\n"
-                "Special mapping rule:\n"
-                "- If the intent implies ACTIVE, map it to NORMAL.\n"
-                "After the retry, proceed normally and then finalize.\n"
-            )
-
-            repair_messages = [
-                SystemMessage(content=SYSTEM_INSTRUCTIONS),
-                SystemMessage(content=notepad_message),
-                *history,
-                HumanMessage(content=user_block),
-                SystemMessage(content=repair_hint),
-                finalizer_message,
-            ]
-
-            logger.info("[%s] running enum-repair retry", run_id)
-            retry_start = time.perf_counter()
-            retry_result = await self.agent.ainvoke(
-                {"messages": repair_messages},
-                config={"recursion_limit": min(MAX_STEPS, 60)},
-            )
-            retry_wall_s = time.perf_counter() - retry_start
-            logger.info("[%s] enum-repair retry finished wall_s=%.3f", run_id, retry_wall_s)
-
-            result = retry_result
-            out_messages = retry_result.get("messages", []) or []
-            _log_tools(out_messages, run_id)
-            tool_trace = _extract_tool_trace(out_messages)
-
-        # Parse final output
         last_text = _find_last_ai_content(out_messages)
         parsed, parse_err = _safe_json_loads(last_text)
 

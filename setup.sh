@@ -140,8 +140,4 @@ else
     echo "Skipping Ollama model download."
 fi
 
-echo "✅ Setup complete. Run your project with: python main.py"
-=======
-echo "✅ Setup complete. Run your project with: python main.py"
-
-## TODO: Add ollama installer
+echo "✅ Setup complete. Run your project with: bash run.sh"

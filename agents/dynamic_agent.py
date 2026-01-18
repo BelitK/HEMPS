@@ -19,7 +19,7 @@ class DynamicAgent(Agent):
         self.name = name
         self.persona = persona or self.DEFAULT_PERSONA
         self.usage = usage or self.DEFAULT_USAGE
-        self.state = "active"
+        self.state = "NORMAL"
 
     def handle_message(self, content, meta):
         print(f"[{self.name}] {content}")
@@ -37,34 +37,26 @@ class DynamicAgent(Agent):
             "state": self.state,
         }
 
+class StockAgent(DynamicAgent):
+    TYPE = "stock"
+    LABEL = "Stock Agent"
+    DEFAULT_PERSONA = "Manages stock portfolio and trading."
+    DEFAULT_USAGE = "Provides stock price forecasts and trading recommendations."
+    CAPABILITIES = ["stocks", "trading", "forecast"]
 
-class IOAgent(DynamicAgent):
-    TYPE = "io"
-    LABEL = "IO Agent"
-    DEFAULT_PERSONA = "Handles input and output operations."
-    DEFAULT_USAGE = "Manages data flow, acknowledgements, and IO-related messages."
-    CAPABILITIES = ["input", "output", "acknowledge"]
-
-    def handle_message(self, content, meta):
-        c = str(content).lower()
-        if "input" in c:
-            print(f"[{self.name}] Input received and processed.")
-        elif "output" in c:
-            print(f"[{self.name}] Output generated successfully.")
-        else:
-            super().handle_message(content, meta)
-
-
-class BatteryAgent(DynamicAgent):
-    TYPE = "battery"
-    LABEL = "Battery Agent"
-    DEFAULT_PERSONA = "Monitors and reports battery status."
-    DEFAULT_USAGE = "Responds to battery queries and reports energy levels."
-    CAPABILITIES = ["battery", "energy", "status"]
+    def get_price_forecast(self, hours: int) -> list:
+        time_values = list(range(hours))
+        return sinusoidal_prices(
+            time_values,
+            base_price=100.0,
+            amplitude=20.0,
+            period=24.0,
+        )
 
     def handle_message(self, content, meta):
-        if "battery" in str(content).lower():
-            print(f"[{self.name}] The current battery level is 85%.")
+        if "price forecast" in str(content).lower():
+            forecast = self.get_price_forecast(24)
+            print(f"[{self.name}] Next 24-hour stock price forecast: {forecast}")
         else:
             super().handle_message(content, meta)
 
@@ -95,8 +87,6 @@ class GridAgent(DynamicAgent):
 if __name__ == "__main__":
     # Simple test
     agents = [
-        IOAgent(name="io_agent"),
-        BatteryAgent(name="battery_agent"),
         GridAgent(name="grid_agent"),
     ]
 
