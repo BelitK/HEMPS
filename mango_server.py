@@ -8,9 +8,12 @@ from typing import Callable
 import tools.scheduler as scheduler
 from tools.scheduler import InMemoryScheduler, ScheduleItem  # adjust path/module name
 
+
+
+from contextlib import asynccontextmanager
+from fastapi_mcp import FastApiMCP
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, ConfigDict, constr
-from fastapi_mcp import FastApiMCP
 
 from mango import Agent, create_topology, activate, create_tcp_container
 
@@ -28,6 +31,7 @@ try:
     from mango.agent.core import State
 except Exception:
     State = None
+
 
 # -------------------------
 # Scheduler
@@ -115,7 +119,8 @@ class CreateAgentRequest(BaseModel):
     name: AgentName
     agent_type: str = Field(default="stock", description="Type of agent to create. Agent type must be selected from the catalog-derived set (fixed at startup).\n"
                             "Choose exactly one. Do not invent new values choose from the agent catalog.\n"
-                            "Don't use 'dynamic' as agent_type.")
+                            "Don't use 'dynamic' as agent_type.\n"
+                            "There are no types such as dynamic or base or generic so don't make up new types.")
 
     state: Literal["NORMAL", "INACTIVE", "BROKEN"] = Field(default="NORMAL",
                                                                description=(
@@ -193,6 +198,7 @@ class ScheduleResponse(BaseModel):
         )
 
 
+
 # -------------------------
 # FastAPI app + runtime state
 # -------------------------
@@ -204,6 +210,10 @@ mcp = FastApiMCP(
     describe_full_response_schema=True,
     describe_all_responses=True,
 )
+
+registry = TopologyRegistry()
+
+
 
 registry = TopologyRegistry()
 
@@ -297,7 +307,6 @@ async def startup():
     await scheduler.start(poll_s=0.5)
 
 
-
 @app.on_event("shutdown")
 async def shutdown():
     await scheduler.stop()
@@ -306,6 +315,11 @@ async def shutdown():
     if topology_ctx:
         topology_ctx.__exit__(None, None, None)
 
+
+
+# -------------------------
+# FastAPI app + runtime state
+# -------------------------
 
 # -------------------------
 # Routes
@@ -475,17 +489,19 @@ async def io_status():
     info = io_agent.get_aggregated_info()
     return info
 
+
 mcp.setup_server()
 mcp.mount_http()
 
-@app.get("/io/forecast")
-async def io_forecast():
-    io_agent = agents_by_name.get("io_agent")
-    if not io_agent or not isinstance(io_agent, IOAgent):
-        raise HTTPException(status_code=500, detail="io_agent 'test_agent' not found")
 
-    info = io_agent.to_llm_format()
-    return info
+# @app.get("/io/forecast")
+# async def io_forecast():
+#     io_agent = agents_by_name.get("io_agent")
+#     if not io_agent or not isinstance(io_agent, IOAgent):
+#         raise HTTPException(status_code=500, detail="io_agent 'test_agent' not found")
+
+#     info = io_agent.to_llm_format()
+#     return info
 
 
 

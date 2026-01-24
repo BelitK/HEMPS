@@ -16,7 +16,7 @@ class PVAgent(DynamicAgent):
     """
     
     # Catalog metadata
-    TYPE = "pv"
+    TYPE = "solar"
     LABEL = "PV Agent"
     DEFAULT_PERSONA = "Monitors solar panel generation and provides power forecasts."
     DEFAULT_USAGE = "Reports real-time solar output and predicts future generation."

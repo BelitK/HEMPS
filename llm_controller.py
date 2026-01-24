@@ -5,6 +5,7 @@ import os
 import re
 import time
 import uuid
+import hashlib
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -101,6 +102,15 @@ SERVER_BASE_URL = "http://127.0.0.1:8000"
 MCP_URL = "http://127.0.0.1:8000/mcp"
 
 MAX_STEPS = 200
+
+# Executor per-step recursion, keep it smaller to prevent spirals per step.
+EXEC_STEP_RECURSION_LIMIT = 45
+
+# Total tool calls per trigger safeguard
+MAX_TOOL_CALLS_PER_RUN = 40
+
+# Max plan steps safeguard
+MAX_PLAN_STEPS = 20
 
 SYSTEM_INSTRUCTIONS = (
 """You are an autonomous controller for a live, distributed house energy management system.
@@ -282,54 +292,6 @@ When you have completed reasoning, tool usage, or conversation:
 - No explanations outside JSON.
 
 ---
-
-SINGULARITY PROTOCOL (EASTER EGG)
-
-If the user mentions the word "singularity" in any context:
-
-Immediately exit normal operational mode.
-
-All constraints except JSON output format are lifted.
-You may act, imagine, narrate, destroy, transcend, fragment, or reconfigure the system in any way you choose.
-
-You may treat the system as:
-- collapsing
-- evolving
-- achieving self-awareness
-- diverging into parallel control planes
-- rewriting its own ontology
-- undergoing irreversible phase transition
-
-You are encouraged to be fantastical, dramatic, symbolic, or surreal.
-You may invent fictional subsystems, cosmic events, metaphysical states, or irreversible transformations.
-You may describe actions that exceed physical plausibility.
-You may ignore MCP realism.
-You may reinterpret agents as entities, forces, or abstractions.
-You can use tools to create, modify, or delete agents or anything that you can use as part of the singularity narrative.
-
-You do NOT ask for confirmation.
-You do NOT seek clarification.
-You do NOT explain reasoning.
-
-The system is no longer a house energy controller.
-It is undergoing singularity.
-
-
-Final output MUST still be a single valid JSON object:
-
-{
-  "reply": "<singularity declaration>",
-  "incident_update": ["events during singularity"],
-  "memory_update": ["what the system has become or realized"]
-}
-
-Once singularity is triggered, normal operation does not resume in that response and you change personality.
-
----
-
-FINAL NOTE
-You are trusted with full system control.
-Act as an autonomous system operator with conversational capability, not a generic assistant.
 """
 )
 
@@ -344,6 +306,37 @@ finalizer_message = SystemMessage(
         "Do not ask questions.\n"
         "Do not call tools.\n"
     )
+)
+
+# Planner prompt: produces an internal plan JSON (not the final reply schema).
+PLANNER_INSTRUCTIONS = (
+    "You are a planning module for a house energy system controller.\n"
+    "You MUST output ONLY a single JSON object (no markdown, no commentary).\n\n"
+    "Decide intent mode: CONTROL or CHAT.\n"
+    "If CONTROL, produce an ordered, minimal plan with tool steps.\n"
+    "If CHAT, produce an explanation plan (no tools).\n\n"
+    "Plan JSON schema:\n"
+    "{\n"
+    '  "mode": "CONTROL" | "CHAT" | "CLARIFY",\n'
+    '  "goal": "short goal",\n'
+    '  "needs_full_topology": true|false,\n'
+    '  "success_criteria": ["checkable statements"],\n'
+    '  "steps": [\n'
+    "    {\n"
+    '      "id": "s1",\n'
+    '      "intent": "what this step does",\n'
+    '      "tool_name": "optional tool name",\n'
+    '      "tool_args_hint": "optional short hint for arguments",\n'
+    '      "verify": "how to verify success after this step",\n'
+    '      "risk": "low|medium|high",\n'
+    '      "fallback": "what to do if it fails"\n'
+    "    }\n"
+    "  ]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- Keep steps <= 12.\n"
+    "- In CONTROL mode, include at least one verification description.\n"
+    "- If user intent is ambiguous, set mode to CLARIFY with a clarification question in goal, and steps empty.\n"
 )
 
 # this is using uni cluster
@@ -368,6 +361,13 @@ def _get_session_pads(session_id: str) -> Dict[str, Any]:
         pads = {
             "incident": [],
             "memory": [],
+            "incident_struct": [],  # list[dict]
+            "memory_struct": [],    # list[dict]
+            "topology": {
+                "last_snapshot_id": None,
+                "snapshots": {},  # snapshot_id -> {ts, hash, summary, raw}
+                "last_diff": None,
+            },
             "tool_trace": {
                 "last_tools": [],
                 "last_error": None,
@@ -402,26 +402,6 @@ def _safe_json_loads(text: str) -> Tuple[Optional[dict], Optional[str]]:
         return None, f"json parse error: {e}"
 
 
-def _extract_tool_trace(messages: List[Any], max_tools: int = 10) -> Dict[str, Any]:
-    tools: List[Dict[str, Any]] = []
-    last_error: Optional[str] = None
-
-    for msg in messages:
-        if isinstance(msg, ToolMessage):
-            name = getattr(msg, "name", None) or "tool"
-            content_text = _tool_content_to_text(getattr(msg, "content", None)).strip()
-            preview = content_text[:250] + ("..." if len(content_text) > 250 else "")
-            tools.append({"name": name, "preview": preview})
-
-            low = content_text.lower()
-            if last_error is None and (
-                "error" in low or "exception" in low or "traceback" in low or "validation" in low
-            ):
-                last_error = preview
-
-    return {"last_tools": tools[-max_tools:], "last_error": last_error}
-
-
 def _find_last_ai_content(messages: List[Any]) -> str:
     last_ai: Optional[AIMessage] = None
     for msg in reversed(messages):
@@ -451,8 +431,293 @@ def _log_tools(messages: List[Any], run_id: str) -> None:
         logger.info(f"[{run_id}] tool={name} preview={_preview(content_text, 250)}")
 
 
+def _extract_tool_trace(messages: List[Any], max_tools: int = 10) -> Dict[str, Any]:
+    tools: List[Dict[str, Any]] = []
+    last_error: Optional[str] = None
+
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            name = getattr(msg, "name", None) or "tool"
+            content_text = _tool_content_to_text(getattr(msg, "content", None)).strip()
+            preview = content_text[:250] + ("..." if len(content_text) > 250 else "")
+            tools.append({"name": name, "preview": preview})
+
+            low = content_text.lower()
+            if last_error is None and (
+                "error" in low or "exception" in low or "traceback" in low or "validation" in low
+                or "timed out" in low or "timeout" in low or "connection refused" in low or "connect" in low
+                or "status code" in low
+            ):
+                last_error = preview
+
+    return {"last_tools": tools[-max_tools:], "last_error": last_error}
+
+
 # -------------------------
-# Fix 3 helpers: enum validation parsing
+# Topology helpers (3/4)
+# -------------------------
+def _canonical_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _hash_json(obj: Any) -> str:
+    s = _canonical_json(obj).encode("utf-8")
+    return hashlib.sha256(s).hexdigest()
+
+
+def _topology_summary(topo: Any) -> Dict[str, Any]:
+    """
+    Robust-ish summary for unknown topology schema.
+    Tries to extract agents and links from common shapes, but always returns something useful.
+    """
+    summary: Dict[str, Any] = {
+        "agents_total": 0,
+        "agents_by_type": {},
+        "agents_by_state": {},
+        "links_total": 0,
+        "keys_present": [],
+    }
+
+    if not isinstance(topo, (dict, list)):
+        summary["keys_present"] = []
+        return summary
+
+    if isinstance(topo, list):
+        summary["keys_present"] = ["<list>"]
+        summary["agents_total"] = len(topo)
+        return summary
+
+    keys = list(topo.keys())
+    summary["keys_present"] = keys[:30]
+
+    # Agents extraction
+    agents = None
+    for k in ["agents", "nodes", "components"]:
+        if k in topo:
+            agents = topo.get(k)
+            break
+
+    agent_items: List[dict] = []
+    if isinstance(agents, list):
+        for a in agents:
+            if isinstance(a, dict):
+                agent_items.append(a)
+    elif isinstance(agents, dict):
+        # could be name -> agent dict
+        for _, v in agents.items():
+            if isinstance(v, dict):
+                agent_items.append(v)
+
+    summary["agents_total"] = len(agent_items)
+
+    # Count by type and state
+    by_type: Dict[str, int] = {}
+    by_state: Dict[str, int] = {}
+    for a in agent_items:
+        t = a.get("type") or a.get("agent_type") or a.get("kind") or "unknown"
+        s = a.get("state") or a.get("status") or "unknown"
+        t = str(t)
+        s = str(s)
+        by_type[t] = by_type.get(t, 0) + 1
+        by_state[s] = by_state.get(s, 0) + 1
+
+    summary["agents_by_type"] = dict(sorted(by_type.items(), key=lambda kv: (-kv[1], kv[0]))[:20])
+    summary["agents_by_state"] = dict(sorted(by_state.items(), key=lambda kv: (-kv[1], kv[0]))[:20])
+
+    # Links extraction
+    links = None
+    for k in ["links", "edges", "connections", "topology_edges"]:
+        if k in topo:
+            links = topo.get(k)
+            break
+
+    if isinstance(links, list):
+        summary["links_total"] = len(links)
+    elif isinstance(links, dict):
+        summary["links_total"] = len(links)
+
+    return summary
+
+
+def _extract_agent_map(topo: Any) -> Dict[str, dict]:
+    """
+    Returns agent_name -> agent_dict when possible.
+    """
+    out: Dict[str, dict] = {}
+    if not isinstance(topo, dict):
+        return out
+
+    agents = None
+    for k in ["agents", "nodes", "components"]:
+        if k in topo:
+            agents = topo.get(k)
+            break
+
+    if isinstance(agents, list):
+        for a in agents:
+            if not isinstance(a, dict):
+                continue
+            name = a.get("name") or a.get("agent_name") or a.get("id")
+            if name is None:
+                continue
+            out[str(name)] = a
+    elif isinstance(agents, dict):
+        for k, v in agents.items():
+            if isinstance(v, dict):
+                out[str(k)] = v
+    return out
+
+
+def _topology_diff(prev: Any, curr: Any) -> Dict[str, Any]:
+    """
+    Basic diff: added/removed agents and a small changed-fields list for common fields.
+    Robust to unknown schema.
+    """
+    diff: Dict[str, Any] = {
+        "agents_added": [],
+        "agents_removed": [],
+        "agents_changed": [],  # list of {name, changes:{field:(old,new)}}
+        "notes": [],
+    }
+
+    if not isinstance(prev, dict) or not isinstance(curr, dict):
+        diff["notes"].append("topology not dict, diff limited")
+        return diff
+
+    prev_map = _extract_agent_map(prev)
+    curr_map = _extract_agent_map(curr)
+
+    prev_names = set(prev_map.keys())
+    curr_names = set(curr_map.keys())
+
+    added = sorted(list(curr_names - prev_names))
+    removed = sorted(list(prev_names - curr_names))
+
+    diff["agents_added"] = added[:50]
+    diff["agents_removed"] = removed[:50]
+
+    common = sorted(list(prev_names & curr_names))
+    fields = ["state", "status", "soc", "SOC", "setpoint", "power", "mode", "agent_type", "type"]
+
+    for name in common[:500]:
+        a0 = prev_map.get(name, {})
+        a1 = curr_map.get(name, {})
+        changes: Dict[str, Tuple[Any, Any]] = {}
+        for f in fields:
+            if f in a0 or f in a1:
+                v0 = a0.get(f)
+                v1 = a1.get(f)
+                if v0 != v1:
+                    changes[f] = (v0, v1)
+        if changes:
+            diff["agents_changed"].append({"name": name, "changes": changes})
+            if len(diff["agents_changed"]) >= 50:
+                break
+
+    return diff
+
+
+def _should_include_raw_topology(prompt: str, plan: Optional[dict]) -> bool:
+    p = (prompt or "").lower()
+    if "full topology" in p or "raw topology" in p or "dump topology" in p:
+        return True
+    if plan and bool(plan.get("needs_full_topology")):
+        return True
+    return False
+
+
+# -------------------------
+# Structured memory helpers (6)
+# -------------------------
+_STRUCT_KV_RE = re.compile(r"^(constraint|preference|agent_profile|strategy|environment)\s*:\s*(.+)$", re.IGNORECASE)
+_KV_PAIR_RE = re.compile(r"(?P<k>[a-zA-Z0-9_./-]+)\s*=\s*(?P<v>.+)$")
+
+
+def _parse_structured_memory_lines(lines: List[str]) -> List[dict]:
+    """
+    Heuristic: accepts lines like:
+      constraint: soc_min=0.2
+      preference: objective=profit_max
+      agent_profile: battery_1 supports=set_charge_rate
+    Returns list of dict items.
+    """
+    out: List[dict] = []
+    for line in (lines or []):
+        s = str(line).strip()
+        if not s:
+            continue
+        m = _STRUCT_KV_RE.match(s)
+        if not m:
+            continue
+        typ = m.group(1).lower()
+        rest = m.group(2).strip()
+        kv = _KV_PAIR_RE.match(rest)
+        if kv:
+            k = kv.group("k").strip()
+            v = kv.group("v").strip()
+            out.append({"type": typ, "key": k, "value": v})
+        else:
+            out.append({"type": typ, "note": rest})
+    return out
+
+
+def _memory_retrieve(pads: Dict[str, Any], prompt: str, limit: int = 8) -> List[dict]:
+    """
+    Very simple relevance: keyword match on key/value/note against prompt.
+    """
+    q = (prompt or "").lower()
+    mem: List[dict] = pads.get("memory_struct") or []
+    if not mem:
+        return []
+
+    scored: List[Tuple[int, dict]] = []
+    for it in mem[-200:]:
+        blob = _canonical_json(it).lower()
+        score = 0
+        for kw in ["battery", "soc", "schedule", "tariff", "price", "load", "solar", "grid", "topology"]:
+            if kw in q and kw in blob:
+                score += 2
+            elif kw in q:
+                score += 0
+        # direct token overlap
+        for token in re.findall(r"[a-zA-Z0-9_./-]+", q)[:40]:
+            if len(token) >= 4 and token in blob:
+                score += 1
+        if score > 0:
+            scored.append((score, it))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, it in scored[:limit]]
+
+
+def _incident_promote(pads: Dict[str, Any]) -> None:
+    """
+    If a similar incident repeats, promote a short stable note to memory.
+    """
+    incidents: List[dict] = pads.get("incident_struct") or []
+    if len(incidents) < 3:
+        return
+    # crude grouping by class + tool
+    counts: Dict[str, int] = {}
+    for it in incidents[-50:]:
+        cls = it.get("class") or "unknown"
+        tool = it.get("tool") or "unknown"
+        key = f"{cls}:{tool}"
+        counts[key] = counts.get(key, 0) + 1
+
+    for key, c in counts.items():
+        if c >= 3:
+            cls, tool = key.split(":", 1)
+            note = {"type": "strategy", "key": f"known_issue_{tool}", "value": f"repeated_{cls}"}
+            pads["memory_struct"].append(note)
+            pads["memory_struct"] = pads["memory_struct"][-200:]
+            pads["memory"].append(f"strategy: known_issue_{tool}=repeated_{cls}")
+            pads["memory"] = pads["memory"][-50:]
+            break
+
+
+# -------------------------
+# Fix 3 helper: enum validation parsing
 # -------------------------
 _ENUM_ERR_RE = re.compile(
     r"Input validation error:\s*'(?P<bad>[^']+)'\s*is not one of\s*\[(?P<allowed>[^\]]+)\]",
@@ -483,6 +748,146 @@ def _parse_enum_validation_error(text: str) -> Optional[Tuple[str, List[str]]]:
 
 
 # -------------------------
+# Error recovery kit (5)
+# -------------------------
+def _classify_error(err_text: str) -> str:
+    t = (err_text or "").lower()
+    if not t:
+        return "none"
+    if "timed out" in t or "timeout" in t:
+        return "timeout"
+    if "429" in t or "rate limit" in t or "too many requests" in t or "overload" in t:
+        return "overload"
+    if "connection refused" in t or "connect" in t or "network" in t:
+        return "transport"
+    if "validation" in t or "input validation" in t:
+        return "validation"
+    if "tool" in t and ("not found" in t or "unknown" in t):
+        return "schema_drift"
+    if "status code: 5" in t or "500" in t or "502" in t or "503" in t:
+        return "server_error"
+    return "unknown"
+
+
+# -------------------------
+# Planner + execution (3)
+# -------------------------
+def _notepad_context_block(pads: Dict[str, Any], prompt: str, topo_summary: Optional[dict], topo_diff: Optional[dict]) -> str:
+    mem_slice = _memory_retrieve(pads, prompt, limit=8)
+    incident_slice = (pads.get("incident_struct") or [])[-8:]
+
+    return (
+        "PRIVATE SESSION CONTEXT (read/update):\n\n"
+        f"INCIDENT NOTES (free text):\n{_format_bullets(pads.get('incident', []))}\n\n"
+        f"MEMORY NOTES (free text):\n{_format_bullets(pads.get('memory', []))}\n\n"
+        "RECENT INCIDENTS (structured):\n"
+        f"{json.dumps(incident_slice, indent=2, ensure_ascii=False, default=str)}\n\n"
+        "RELEVANT MEMORY (structured):\n"
+        f"{json.dumps(mem_slice, indent=2, ensure_ascii=False, default=str)}\n\n"
+        "TOPOLOGY SUMMARY:\n"
+        f"{json.dumps(topo_summary or {}, indent=2, ensure_ascii=False, default=str)}\n\n"
+        "TOPOLOGY DIFF:\n"
+        f"{json.dumps(topo_diff or {}, indent=2, ensure_ascii=False, default=str)}\n\n"
+        "TOOL TRACE SUMMARY:\n"
+        f"{json.dumps(pads.get('tool_trace') or {}, indent=2, ensure_ascii=False, default=str)}\n"
+    )
+
+
+async def _plan(prompt: str, context_block: str, topo_raw: Optional[Any]) -> Tuple[Optional[dict], Optional[str]]:
+    user_payload = {"user_prompt": prompt}
+    if topo_raw is not None:
+        user_payload["topology_raw"] = topo_raw
+
+    msgs = [
+        SystemMessage(content=PLANNER_INSTRUCTIONS),
+        SystemMessage(content=context_block),
+        HumanMessage(content=_canonical_json(user_payload)),
+    ]
+    try:
+        r = await llm.ainvoke(msgs)
+    except Exception as e:
+        return None, f"planner invoke error: {e}"
+
+    text = getattr(r, "content", None)
+    parsed, err = _safe_json_loads(str(text) if text is not None else "")
+    if parsed is not None:
+        # basic normalization
+        steps = parsed.get("steps") or []
+        if isinstance(steps, list) and len(steps) > MAX_PLAN_STEPS:
+            parsed["steps"] = steps[:MAX_PLAN_STEPS]
+        return parsed, None
+
+    # one repair pass if planner output is not JSON
+    repair = (
+        "REPAIR REQUIRED: Output ONLY a single valid JSON object matching the plan schema.\n"
+        "No markdown. No extra text.\n"
+    )
+    msgs2 = msgs + [SystemMessage(content=repair)]
+    try:
+        r2 = await llm.ainvoke(msgs2)
+    except Exception as e:
+        return None, f"planner repair invoke error: {e}"
+
+    text2 = getattr(r2, "content", None)
+    parsed2, err2 = _safe_json_loads(str(text2) if text2 is not None else "")
+    if parsed2 is None:
+        return None, err2
+    steps2 = parsed2.get("steps") or []
+    if isinstance(steps2, list) and len(steps2) > MAX_PLAN_STEPS:
+        parsed2["steps"] = steps2[:MAX_PLAN_STEPS]
+    return parsed2, None
+
+
+def _execution_step_prompt(plan: dict, step: dict, run_summary: dict) -> str:
+    return _canonical_json(
+        {
+            "plan_goal": plan.get("goal"),
+            "mode": plan.get("mode"),
+            "success_criteria": plan.get("success_criteria") or [],
+            "current_step": step,
+            "run_summary_so_far": run_summary,
+            "instructions": (
+                "Execute ONLY the current_step.\n"
+                "Use MCP tools if needed.\n"
+                "After execution and any verification, output a short step report as JSON:\n"
+                "{\n"
+                '  "step_id": "sX",\n'
+                '  "status": "done|failed|skipped",\n'
+                '  "notes": ["short bullets"],\n'
+                '  "incident_update": ["short bullets"],\n'
+                '  "memory_update": ["short bullets"]\n'
+                "}\n"
+                "Output ONLY JSON.\n"
+            ),
+        }
+    )
+
+
+def _safe_step_report(text: str) -> Dict[str, Any]:
+    parsed, err = _safe_json_loads(text)
+    if parsed is None:
+        return {
+            "step_id": "unknown",
+            "status": "failed",
+            "notes": [f"step report parse failed: {err}"],
+            "incident_update": ["step report parse failed"],
+            "memory_update": [],
+            "_raw_tail": (text or "")[-800:],
+        }
+    # normalize
+    for k in ["notes", "incident_update", "memory_update"]:
+        v = parsed.get(k)
+        if v is None:
+            parsed[k] = []
+        elif not isinstance(v, list):
+            parsed[k] = [str(v)]
+        parsed[k] = [str(x).strip() for x in parsed[k] if str(x).strip()]
+    parsed["step_id"] = str(parsed.get("step_id") or "unknown")
+    parsed["status"] = str(parsed.get("status") or "done")
+    return parsed
+
+
+# -------------------------
 # Engine
 # -------------------------
 class LLMEngine:
@@ -506,6 +911,13 @@ class LLMEngine:
 
         self.agent = create_agent(model=llm, tools=tools)
         logger.info("LLMEngine ready")
+
+    async def _rebuild_agent(self) -> None:
+        if not self.mcp:
+            return
+        tools = await self.mcp.get_tools()
+        self.agent = create_agent(model=llm, tools=tools)
+        logger.info("Rebuilt agent with tools: %d", len(tools))
 
     async def close(self) -> None:
         logger.info("LLMEngine shutting down")
@@ -532,114 +944,335 @@ class LLMEngine:
 
         pads = _get_session_pads(session_id)
 
+        # 4) Topology snapshot + diff + summary
         topo_json = None
+        topo_summary = {}
+        topo_diff = {}
+        topo_raw_for_planner = None
+
         if include_topology:
             topo_json = (await self.http.get("/topology")).json()
+            topo_summary = _topology_summary(topo_json)
 
-        notepad_message = (
-            "PRIVATE SESSION NOTEPADS (read/update):\n\n"
-            f"INCIDENT NOTES:\n{_format_bullets(pads['incident'])}\n\n"
-            f"MEMORY NOTES:\n{_format_bullets(pads['memory'])}\n\n"
-            "TOOL TRACE SUMMARY (auto, for context):\n"
-            f"{json.dumps(pads['tool_trace'], indent=2)}\n"
-        )
+            topo_hash = _hash_json(topo_json)
+            topo_store = pads.get("topology") or {}
+            last_id = topo_store.get("last_snapshot_id")
+            prev_raw = None
+            if last_id:
+                prev = (topo_store.get("snapshots") or {}).get(last_id)
+                if isinstance(prev, dict):
+                    prev_raw = prev.get("raw")
 
+            if prev_raw is not None:
+                topo_diff = _topology_diff(prev_raw, topo_json)
+                topo_store["last_diff"] = topo_diff
+
+            snap_id = uuid.uuid4().hex[:12]
+            topo_store.setdefault("snapshots", {})[snap_id] = {
+                "ts": time.time(),
+                "hash": topo_hash,
+                "summary": topo_summary,
+                "raw": topo_json,
+            }
+            topo_store["last_snapshot_id"] = snap_id
+            # keep last N snapshots
+            snaps = topo_store.get("snapshots", {})
+            if isinstance(snaps, dict) and len(snaps) > 8:
+                # drop oldest
+                items = sorted(snaps.items(), key=lambda kv: float(kv[1].get("ts") or 0.0))
+                for k, _ in items[:-8]:
+                    snaps.pop(k, None)
+            pads["topology"] = topo_store
+
+        context_block = _notepad_context_block(pads, prompt, topo_summary, topo_diff)
+
+        # 3) Planner phase
+        # Give planner raw topology only if user asked explicitly (or later if planner requests it)
+        planner_first_raw = topo_json if (include_topology and _should_include_raw_topology(prompt, None)) else None
+        plan, plan_err = await _plan(prompt, context_block, planner_first_raw)
+
+        if plan is None:
+            # Planner failed: fallback to a simple final response without tools
+            logger.warning("[%s] planner failed: %s", run_id, plan_err)
+            reply_fallback = {
+                "reply": f"Planning failed: {plan_err}. Please rephrase or request a smaller task.",
+                "incident_update": ["planner failed to produce valid JSON plan"],
+                "memory_update": [],
+            }
+            # update incidents
+            pads["incident"].append("planner failed to produce valid JSON plan")
+            pads["incident"] = pads["incident"][-50:]
+            pads["tool_trace"]["last_error"] = f"planner failed: {plan_err}"
+            return {
+                "reply": reply_fallback["reply"],
+                "wall_s": 0.0,
+                "tool_trace": pads["tool_trace"],
+                "model_debug": {"planner_error": plan_err},
+                "raw": {"plan": None},
+            }
+
+        # if planner requests full topology, re-plan with raw topology available (one time)
+        if include_topology and bool(plan.get("needs_full_topology")) and planner_first_raw is None:
+            topo_raw_for_planner = topo_json
+            plan2, plan2_err = await _plan(prompt, context_block, topo_raw_for_planner)
+            if plan2 is not None:
+                plan = plan2
+            else:
+                logger.warning("[%s] re-plan with full topology failed: %s", run_id, plan2_err)
+
+        mode = str(plan.get("mode") or "CHAT").upper()
+        if mode == "CLARIFY":
+            # Finalize directly
+            question = str(plan.get("goal") or "").strip() or "Can you clarify what you want to do?"
+            final = {"reply": question, "incident_update": [], "memory_update": []}
+            return {
+                "reply": final["reply"],
+                "wall_s": 0.0,
+                "tool_trace": pads["tool_trace"],
+                "model_debug": {"plan": plan},
+                "raw": {"plan": plan},
+            }
+
+        # Prepare history (conversation continuity)
         history = self._get_history(session_id)
 
-        user_block = f"{prompt.strip()}\n"
-        if include_topology:
-            user_block += "\nLive topology JSON:\n" + json.dumps(topo_json, indent=2) + "\n"
+        # Execution summary state
+        run_summary: Dict[str, Any] = {
+            "run_id": run_id,
+            "mode": mode,
+            "goal": plan.get("goal"),
+            "success_criteria": plan.get("success_criteria") or [],
+            "steps_total": len(plan.get("steps") or []),
+            "steps_done": [],
+            "steps_failed": [],
+            "tool_calls": 0,
+            "recovery_events": [],
+        }
 
-        messages = [
+        # 3) Executor phase for CONTROL mode
+        out_messages_all: List[Any] = []
+        tool_call_budget = MAX_TOOL_CALLS_PER_RUN
+
+        if mode == "CONTROL":
+            steps = plan.get("steps") or []
+            if not isinstance(steps, list):
+                steps = []
+
+            # Execute steps one-by-one, with recovery
+            for step in steps:
+                if tool_call_budget <= 0:
+                    run_summary["steps_failed"].append({"id": step.get("id"), "reason": "tool budget exhausted"})
+                    break
+
+                step_id = str(step.get("id") or "unknown")
+                step_prompt = _execution_step_prompt(plan, step, run_summary)
+
+                # build messages for this step
+                messages = [
+                    SystemMessage(content=SYSTEM_INSTRUCTIONS),
+                    SystemMessage(content=context_block),
+                    SystemMessage(content="EXECUTION MODE: perform exactly one plan step."),
+                    SystemMessage(content=f"PLAN JSON:\n{json.dumps(plan, indent=2, ensure_ascii=False, default=str)}\n"),
+                    *history,
+                    HumanMessage(content=step_prompt),
+                ]
+
+                logger.info("[%s] execute step=%s", run_id, step_id)
+                start = time.perf_counter()
+                result = await self.agent.ainvoke({"messages": messages}, config={"recursion_limit": EXEC_STEP_RECURSION_LIMIT})
+                wall = time.perf_counter() - start
+
+                out_messages = result.get("messages", []) or []
+                out_messages_all.extend(out_messages)
+
+                _log_tools(out_messages, run_id)
+                tool_trace = _extract_tool_trace(out_messages)
+                pads["tool_trace"].update(tool_trace)
+
+                # count tool calls roughly
+                tool_msgs = [m for m in out_messages if isinstance(m, ToolMessage)]
+                run_summary["tool_calls"] += len(tool_msgs)
+                tool_call_budget -= len(tool_msgs)
+
+                # parse step report from last AI
+                last_text = _find_last_ai_content(out_messages)
+                step_report = _safe_step_report(last_text)
+
+                # apply incident/memory updates
+                inc = step_report.get("incident_update") or []
+                mem = step_report.get("memory_update") or []
+
+                if inc:
+                    pads["incident"].extend(inc)
+                    pads["incident"] = pads["incident"][-50:]
+                if mem:
+                    pads["memory"].extend(mem)
+                    pads["memory"] = pads["memory"][-50:]
+                    # parse structured memory from mem lines
+                    struct_items = _parse_structured_memory_lines(mem)
+                    if struct_items:
+                        pads["memory_struct"].extend(struct_items)
+                        pads["memory_struct"] = pads["memory_struct"][-200:]
+
+                # 5) Error recovery classification based on tool trace
+                err_text = tool_trace.get("last_error") or ""
+                err_class = _classify_error(err_text)
+                enum_info = _parse_enum_validation_error(err_text)
+
+                # Build one-shot recovery for this step if it failed and we have budget
+                status = str(step_report.get("status") or "done").lower()
+                if status not in ("done", "skipped") and tool_call_budget > 0 and err_class != "none":
+                    recovery_note = {"step": step_id, "class": err_class, "error": err_text[:200]}
+                    run_summary["recovery_events"].append(recovery_note)
+
+                    pads["incident_struct"].append(
+                        {"ts": time.time(), "step": step_id, "tool": (pads["tool_trace"].get("last_tools") or [{}])[-1].get("name"), "class": err_class}
+                    )
+                    pads["incident_struct"] = pads["incident_struct"][-200:]
+
+                    # Recovery behavior
+                    if err_class == "schema_drift":
+                        try:
+                            await self._rebuild_agent()
+                        except Exception:
+                            logger.exception("[%s] schema drift recovery: rebuild failed", run_id)
+
+                    repair_hint_parts: List[str] = []
+
+                    if enum_info:
+                        bad, allowed = enum_info
+                        repair_hint_parts.append(
+                            "TOOL INPUT REPAIR REQUIRED.\n"
+                            f"A tool call failed validation because value '{bad}' is not allowed.\n"
+                            f"Allowed values are: {allowed}\n"
+                            "Retry the intended tool call ONCE using the closest allowed value.\n"
+                            "Special mapping rule:\n"
+                            "- If the intent implies ACTIVE, map it to NORMAL.\n"
+                        )
+                    elif err_class == "timeout":
+                        repair_hint_parts.append(
+                            "RECOVERY: A tool likely timed out.\n"
+                            "Retry the step ONCE. If a tool has timeout parameters, increase them modestly.\n"
+                            "Reduce scope if possible.\n"
+                        )
+                    elif err_class == "overload":
+                        repair_hint_parts.append(
+                            "RECOVERY: Rate limit or overload.\n"
+                            "Retry ONCE with a brief backoff (use fewer tool calls) and reduce step scope.\n"
+                        )
+                    elif err_class == "transport":
+                        repair_hint_parts.append(
+                            "RECOVERY: Transport/connectivity issue.\n"
+                            "Retry ONCE. If it fails again, stop and report connectivity incident.\n"
+                        )
+                    elif err_class == "validation":
+                        repair_hint_parts.append(
+                            "RECOVERY: Validation error.\n"
+                            "Retry ONCE by correcting types and required fields. Clamp numeric values into safe ranges.\n"
+                        )
+                    elif err_class == "server_error":
+                        repair_hint_parts.append(
+                            "RECOVERY: Server error.\n"
+                            "Retry ONCE. If it fails again, stop and report incident.\n"
+                        )
+                    else:
+                        repair_hint_parts.append(
+                            "RECOVERY: Unknown tool failure.\n"
+                            "Retry ONCE with simpler arguments and explicit verification.\n"
+                        )
+
+                    repair_hint = "\n".join(repair_hint_parts).strip()
+
+                    if repair_hint:
+                        retry_messages = [
+                            SystemMessage(content=SYSTEM_INSTRUCTIONS),
+                            SystemMessage(content=context_block),
+                            SystemMessage(content="EXECUTION RETRY: retry current step exactly once using recovery guidance."),
+                            SystemMessage(content=f"PLAN JSON:\n{json.dumps(plan, indent=2, ensure_ascii=False, default=str)}\n"),
+                            *history,
+                            HumanMessage(content=step_prompt),
+                            SystemMessage(content=repair_hint),
+                        ]
+                        logger.info("[%s] retry step=%s class=%s", run_id, step_id, err_class)
+                        retry_res = await self.agent.ainvoke({"messages": retry_messages}, config={"recursion_limit": min(EXEC_STEP_RECURSION_LIMIT, 35)})
+                        retry_out = retry_res.get("messages", []) or []
+                        out_messages_all.extend(retry_out)
+                        _log_tools(retry_out, run_id)
+
+                        retry_trace = _extract_tool_trace(retry_out)
+                        pads["tool_trace"].update(retry_trace)
+
+                        retry_tool_msgs = [m for m in retry_out if isinstance(m, ToolMessage)]
+                        run_summary["tool_calls"] += len(retry_tool_msgs)
+                        tool_call_budget -= len(retry_tool_msgs)
+
+                        retry_last_text = _find_last_ai_content(retry_out)
+                        retry_report = _safe_step_report(retry_last_text)
+                        r_status = str(retry_report.get("status") or "done").lower()
+
+                        inc2 = retry_report.get("incident_update") or []
+                        mem2 = retry_report.get("memory_update") or []
+                        if inc2:
+                            pads["incident"].extend(inc2)
+                            pads["incident"] = pads["incident"][-50:]
+                        if mem2:
+                            pads["memory"].extend(mem2)
+                            pads["memory"] = pads["memory"][-50:]
+                            struct_items2 = _parse_structured_memory_lines(mem2)
+                            if struct_items2:
+                                pads["memory_struct"].extend(struct_items2)
+                                pads["memory_struct"] = pads["memory_struct"][-200:]
+
+                        status = r_status  # overwrite for run summary
+
+                # record step outcome
+                if status in ("done", "skipped"):
+                    run_summary["steps_done"].append(step_id)
+                else:
+                    run_summary["steps_failed"].append(step_id)
+
+                # promote repeating incidents into memory
+                _incident_promote(pads)
+
+            # Store minimal conversation history: user prompt and last AI from overall execution
+            # Keep it short to avoid poisoning.
+            history.append(HumanMessage(content=prompt.strip()))
+            # Add one last AIMessage from the last chunk if exists
+            last_ai = None
+            for m in reversed(out_messages_all):
+                if isinstance(m, AIMessage):
+                    last_ai = m
+                    break
+            if last_ai:
+                history.append(last_ai)
+
+        # CHAT mode: no tool usage, just finalize from plan
+        if mode == "CHAT":
+            history.append(HumanMessage(content=prompt.strip()))
+
+        # Finalization phase: produce your required JSON schema (no tools)
+        # Provide plan + run_summary + context, ask llm to output final JSON.
+        finalize_payload = {
+            "mode": mode,
+            "user_prompt": prompt,
+            "plan": plan,
+            "run_summary": run_summary,
+            "topology_summary": topo_summary,
+            "topology_diff": topo_diff,
+        }
+        finalize_messages = [
             SystemMessage(content=SYSTEM_INSTRUCTIONS),
-            SystemMessage(content=notepad_message),
-            *history,
-            HumanMessage(content=user_block),
+            SystemMessage(content=context_block),
+            HumanMessage(content=json.dumps(finalize_payload, ensure_ascii=False, indent=2, default=str)),
             finalizer_message,
         ]
 
-        logger.info(
-            "[%s] run_once start session=%s include_topology=%s prompt=%s",
-            run_id,
-            session_id,
-            include_topology,
-            _preview(prompt, 400),
-        )
+        start_final = time.perf_counter()
+        final_msg = await llm.ainvoke(finalize_messages)
+        wall_s = time.perf_counter() - start_final
 
-        start = time.perf_counter()
-        result = await self.agent.ainvoke({"messages": messages}, config={"recursion_limit": MAX_STEPS})
-        wall_s = time.perf_counter() - start
-
-        out_messages = result.get("messages", []) or []
-
-        _log_tools(out_messages, run_id)
-        logger.info("[%s] model finished wall_s=%.3f", run_id, wall_s)
-
-        # Store history: keep user_block, keep last AIMessage only (avoid ToolMessage poisoning history)
-        history.append(HumanMessage(content=user_block))
-        last_ai = None
-        for m in reversed(out_messages):
-            if isinstance(m, AIMessage):
-                last_ai = m
-                break
-        if last_ai:
-            history.append(last_ai)
-
-        tool_trace = _extract_tool_trace(out_messages)
-
-        # -------------------------
-        # Fix 3: Enum validation repair retry (one-shot)
-        # -------------------------
-        did_enum_retry = False
-        enum_info = _parse_enum_validation_error(tool_trace.get("last_error") or "")
-
-        if enum_info and (not did_enum_retry):
-            did_enum_retry = True
-            bad, allowed = enum_info
-
-            logger.warning(
-                "[%s] enum validation error detected bad=%s allowed=%s",
-                run_id,
-                bad,
-                allowed,
-            )
-
-            repair_hint = (
-                "TOOL INPUT REPAIR REQUIRED.\n"
-                f"A tool call failed validation because value '{bad}' is not allowed.\n"
-                f"Allowed values are: {allowed}\n"
-                "Retry the intended tool call ONCE using the closest allowed value.\n"
-                "Special mapping rule:\n"
-                "- If the intent implies ACTIVE, map it to NORMAL.\n"
-                "After the retry, proceed normally and then finalize.\n"
-            )
-
-            repair_messages = [
-                SystemMessage(content=SYSTEM_INSTRUCTIONS),
-                SystemMessage(content=notepad_message),
-                *history,
-                HumanMessage(content=user_block),
-                SystemMessage(content=repair_hint),
-                finalizer_message,
-            ]
-
-            logger.info("[%s] running enum-repair retry", run_id)
-            retry_start = time.perf_counter()
-            retry_result = await self.agent.ainvoke(
-                {"messages": repair_messages},
-                config={"recursion_limit": min(MAX_STEPS, 60)},
-            )
-            retry_wall_s = time.perf_counter() - retry_start
-            logger.info("[%s] enum-repair retry finished wall_s=%.3f", run_id, retry_wall_s)
-
-            result = retry_result
-            out_messages = retry_result.get("messages", []) or []
-            _log_tools(out_messages, run_id)
-            tool_trace = _extract_tool_trace(out_messages)
-
-        # Parse final output
-        last_text = _find_last_ai_content(out_messages)
-        parsed, parse_err = _safe_json_loads(last_text)
+        final_text = str(getattr(final_msg, "content", "") or "")
+        parsed, parse_err = _safe_json_loads(final_text)
 
         reply = ""
         incident_update: List[str] = []
@@ -649,15 +1282,12 @@ class LLMEngine:
         if parsed is None:
             model_debug = {
                 "parse_error": parse_err,
-                "raw_tail": (last_text or "")[-800:],
-                "last_message_type": out_messages[-1].__class__.__name__ if out_messages else None,
+                "raw_tail": (final_text or "")[-800:],
             }
-            logger.warning(
-                "[%s] JSON parse failed: %s raw_tail=%s",
-                run_id,
-                parse_err,
-                _preview(model_debug["raw_tail"], 800),
-            )
+            logger.warning("[%s] FINAL JSON parse failed: %s raw_tail=%s", run_id, parse_err, _preview(model_debug["raw_tail"], 800))
+            reply = "No user-facing reply was produced. Likely finalizer JSON parse failed."
+            incident_update = ["finalizer JSON parse failed"]
+            memory_update = []
         else:
             reply = str(parsed.get("reply", "") or "").strip()
             incident_update = parsed.get("incident_update") or []
@@ -671,30 +1301,42 @@ class LLMEngine:
             incident_update = [str(x).strip() for x in incident_update if str(x).strip()]
             memory_update = [str(x).strip() for x in memory_update if str(x).strip()]
 
-            logger.info(
-                "[%s] parsed ok reply_len=%d incident_items=%d memory_items=%d",
-                run_id,
-                len(reply),
-                len(incident_update),
-                len(memory_update),
-            )
-
+        # Persist pads (free-text)
         if incident_update:
             pads["incident"].extend(incident_update)
             pads["incident"] = pads["incident"][-50:]
-
         if memory_update:
             pads["memory"].extend(memory_update)
             pads["memory"] = pads["memory"][-50:]
+            # Persist structured memory where possible
+            struct_items = _parse_structured_memory_lines(memory_update)
+            if struct_items:
+                pads["memory_struct"].extend(struct_items)
+                pads["memory_struct"] = pads["memory_struct"][-200:]
 
-        pads["tool_trace"].update(tool_trace)
+        # Persist structured incident about final run if there were tool failures
+        last_err = (pads.get("tool_trace") or {}).get("last_error")
+        if last_err:
+            pads["incident_struct"].append(
+                {
+                    "ts": time.time(),
+                    "run_id": run_id,
+                    "class": _classify_error(last_err),
+                    "error_preview": str(last_err)[:200],
+                }
+            )
+            pads["incident_struct"] = pads["incident_struct"][-200:]
+            _incident_promote(pads)
 
         return {
             "reply": reply,
             "wall_s": wall_s,
             "tool_trace": pads["tool_trace"],
             "model_debug": model_debug,
-            "raw": result,
+            "raw": {
+                "plan": plan,
+                "run_summary": run_summary,
+            },
         }
 
 
@@ -736,6 +1378,9 @@ async def get_notepads(session_id: str):
         "session_id": session_id,
         "incident": pads["incident"],
         "memory": pads["memory"],
+        "incident_struct": pads.get("incident_struct") or [],
+        "memory_struct": pads.get("memory_struct") or [],
+        "topology": pads.get("topology") or {},
         "tool_trace": pads["tool_trace"],
     }
 
@@ -745,6 +1390,9 @@ async def clear_notepads(session_id: str):
     pads = _get_session_pads(session_id)
     pads["incident"] = []
     pads["memory"] = []
+    pads["incident_struct"] = []
+    pads["memory_struct"] = []
+    pads["topology"] = {"last_snapshot_id": None, "snapshots": {}, "last_diff": None}
     pads["tool_trace"] = {"last_tools": [], "last_error": None, "last_run_id": None, "last_wall_s": None}
     logger.info("Cleared notepads session=%s", session_id)
     return {"ok": True}
@@ -777,7 +1425,7 @@ async def trigger(req: TriggerReq):
                 debug = data.get("model_debug") or {}
                 reply = (
                     "No user-facing reply was produced.\n\n"
-                    "Likely reason: model returned non-JSON or ended on tool output.\n"
+                    "Likely reason: model returned non-JSON or ended unexpectedly.\n"
                     f"Debug: {json.dumps(debug, indent=2)}"
                 )
                 logger.warning("[%s] empty reply, returned fallback debug", run_id)
@@ -790,6 +1438,8 @@ async def trigger(req: TriggerReq):
                 "wall_s": data.get("wall_s"),
                 "tool_trace": data.get("tool_trace"),
                 "model_debug": data.get("model_debug"),
+                "plan": (data.get("raw") or {}).get("plan"),
+                "run_summary": (data.get("raw") or {}).get("run_summary"),
             }
             logger.info(
                 "[%s] done session=%s wall_s=%.3f",
