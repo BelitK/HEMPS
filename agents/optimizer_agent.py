@@ -1,19 +1,21 @@
-
-
 from typing import Any, Dict, List
+
+from dynamic_agent import DynamicAgent
+from message import Message, MessageLevel
 from pulp import (
-    LpProblem,
-    LpVariable,
     LpMinimize,
-    lpSum,
+    LpProblem,
     LpStatus,
+    LpVariable,
+    lpSum,
     value,
 )
 
-from .dynamic_agent import DynamicAgent
-from .message import Message, MessageLevel
-
-
+# TODO change the schedule. communicate only with scheduler. update at the beginning of the day
+# TODO look into the scheduler and understand how it forwards information
+# TODO http requests to get info from scheduler
+# TODO fix message format for the communication with the scheduler
+# TODO use @http.localhost.80000/scheduler/@_schedule or something like that, add payload to request with necessary info from optimization result
 class OptimizerAgent(DynamicAgent):
     """
     Optimizer Agent
