@@ -86,6 +86,8 @@ echo "  Port: $UI_PORT"
 echo "  Log:  $UI_LOG"
 echo "========================================"
 
+# TODO add npx @modelcontextprotocol/inspector
+
 # Streamlit binds separately with --server.address/--server.port
 # Note: --server.headless=true prevents Streamlit from trying to open a browser automatically.
 streamlit run ui.py \
