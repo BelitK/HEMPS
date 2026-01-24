@@ -1,6 +1,5 @@
 from enum import Enum
-from typing import List, Optional, TypeAlias, Enum 
-
+from typing import List, Optional, TypeAlias
 
 # define payload as type
 Payload: TypeAlias = dict[List[float]]
