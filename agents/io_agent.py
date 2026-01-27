@@ -92,11 +92,12 @@ class IOAgent(DynamicAgent):
         Aggregate info from all connected agents.
         Returns the complete picture for the Dispatcher/LLM.
         """
+        neighbor_addrs = self.neighbors()
         return {
             "io_agent": self.name,
-            "connected_agents": self.connected_agents,
+            "connected_agents": neighbor_addrs,
             "available_actions": self.actions,
-            "agent_count": len(self.connected_agents)
+            "agent_count": len(neighbor_addrs)
         }
     
     def info(self) -> Dict[str, Any]:
@@ -107,7 +108,7 @@ class IOAgent(DynamicAgent):
         base_info = super().info()
         base_info.update({
             "type": "io_agent",
-            "connected_agents": list(self.connected_agents.keys()),
+            "connected_agents": self.neighbors,
             "available_actions": self.actions,
             "aggregated_data": self.get_aggregated_info()
         })
