@@ -1,5 +1,6 @@
+from encodings.cp932 import codec
 import re
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, Annotated
 
 
 import time
@@ -13,14 +14,16 @@ from tools.scheduler import InMemoryScheduler, ScheduleItem  # adjust path/modul
 from contextlib import asynccontextmanager
 from fastapi_mcp import FastApiMCP
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, ConfigDict, constr
+from pydantic import BaseModel, Field, ConfigDict, constr, StringConstraints
 
 from mango import Agent, create_topology, activate, create_tcp_container
 
 from agents.CriticalMonitorAgent import CriticalMonitorAgent
 from agents.dynamic_agent import DynamicAgent
+from agents.test_agent import Router_Agent
 from agents.io_agent import IOAgent
 from agents.agent_catalog import generate_agent_catalog
+from agents.message import Message, MessageLevel
 
 from tools.check_tools import CheckTools
 from tools.TopoRegistry import TopologyRegistry
@@ -29,6 +32,7 @@ from tools.TopoRegistry import TopologyRegistry
 # Try importing Mango State enum for link activation
 try:
     from mango.agent.core import State
+    from mango import JSON
 except Exception:
     State = None
 
@@ -78,8 +82,16 @@ async def run_agent_action(agent_name: str, action: str, payload: Dict[str, Any]
 # -------------------------
 # Guards
 # -------------------------
-AgentName = constr(pattern=r"^[a-z][a-z0-9_]{0,31}$")
 
+AgentName = Annotated[
+    str,
+    StringConstraints(
+        pattern=r"^[a-z][a-z0-9_]{0,31}$",
+        min_length=1,
+        max_length=32,
+        strip_whitespace=True,
+    ),
+]
 
 # -------------------------
 # Agent type map (auto)
@@ -108,7 +120,7 @@ def _build_agent_class_map() -> Dict[str, type]:
 
 
 AGENT_CLASS_MAP = _build_agent_class_map()
-
+AGENTS = sorted(list(AGENT_CLASS_MAP.keys()))
 
 # -------------------------
 # API Schemas
@@ -117,7 +129,7 @@ class CreateAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: AgentName
-    agent_type: str = Field(default="stock", description="Type of agent to create. Agent type must be selected from the catalog-derived set (fixed at startup).\n"
+    agent_type: Literal[*AGENTS] = Field(default="stock", description="Type of agent to create. Agent type must be selected from the catalog-derived set (fixed at startup).\n"
                             "Choose exactly one. Do not invent new values choose from the agent catalog.\n"
                             "Don't use 'dynamic' as agent_type.\n"
                             "There are no types such as dynamic or base or generic so don't make up new types.")
@@ -258,14 +270,16 @@ def _set_mango_edge_state(src_id: int, dst_id: int, state_str: str) -> None:
 # -------------------------
 @app.on_event("startup")
 async def startup():
-    global container, topology_ctx, topology, activation_manager
+    global container, topology_ctx, topology, activation_managerv
+    codec = JSON()
+    codec.add_serializer(*Message.__serializer__())
 
-    container = create_tcp_container(("127.0.0.1", 0))
+    container = create_tcp_container(("127.0.0.1", 0),codec=codec)
     topology_ctx = create_topology()
     topology = topology_ctx.__enter__()
 
     # Router
-    router = DynamicAgent(
+    router = Router_Agent(
         name="router",
         persona="Routes messages and acts as the central hub.",
         usage="network router",
@@ -296,6 +310,7 @@ async def startup():
     agents_by_name["io_agent"] = test_agent
     container.register(test_agent)
     registry.upsert_edge("io_agent", "router",  state="NORMAL")
+    registry.upsert_edge("router", "io_agent",  state="NORMAL")
 
     if hasattr(topology, "inject"):
         topology.inject()
@@ -326,7 +341,12 @@ async def shutdown():
 # -------------------------
 @app.get("/agent_catalog")
 async def agent_catalog():
-    return generate_agent_catalog()
+    # Return the generated catalog but only include types that the server supports
+    catalog = generate_agent_catalog()
+    allowed = set(AGENT_CLASS_MAP.keys())
+    types = [a for a in catalog.get("agent_types", []) if a.get("type") in allowed]
+    catalog["agent_types"] = types
+    return catalog
 
 
 @app.get("/topology")
@@ -489,6 +509,50 @@ async def io_status():
     info = io_agent.get_aggregated_info()
     return info
 
+@app.post("/io/send_message")
+async def send_message_to_io_agent(req: dict):
+    io_agent = agents_by_name.get("io_agent")
+    if not io_agent or not isinstance(io_agent, IOAgent):
+        raise HTTPException(status_code=500, detail="IOAgent 'io_agent' not found")
+
+    # Forward the message to the IO agent
+    io_agent.handle_message(content=req["content"], meta=req["meta"])
+    return {"status": "message sent to IO agent"}
+
+class SendMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_name: AgentName
+    content: AgentName
+    meta: str
+
+
+@app.post("/send_message")
+async def send_message_to_agent(req: SendMessageRequest):
+    agent_name = req.get("agent_name")
+    content = req.get("content")
+    meta = req.get("meta")
+
+    agent = agents_by_name.get(agent_name)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
+
+    agent.handle_message(content=content, meta=meta)
+    return {"status": f"message sent to agent '{agent_name}'"}
+
+@app.get('/trigger_emergency')
+async def trigger_emergency():
+    critical_agent = agents_by_name.get("critical_monitor")
+    if not critical_agent or not isinstance(critical_agent, CriticalMonitorAgent):
+        raise HTTPException(status_code=500, detail="CriticalMonitorAgent 'critical_monitor' not found")
+
+    # Simulate an emergency condition
+    emergency_message = {
+        "type": "emergency",
+        "details": "Simulated critical condition triggered."
+    }
+    critical_agent.handle_message(content=emergency_message, meta={"source": "test"})
+
+    return {"status": "emergency condition triggered in Critical agent"}
 
 mcp.setup_server()
 mcp.mount_http()

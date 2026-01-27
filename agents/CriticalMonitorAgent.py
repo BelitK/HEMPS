@@ -6,6 +6,12 @@ from agents.dynamic_agent import DynamicAgent
 
 
 class CriticalMonitorAgent(DynamicAgent):
+
+    TYPE="critical_monitor"
+    LABEL="Critical Monitor Agent"
+    DEFAULT_PERSONA="Monitors for critical events and triggers LLM incident response."
+    DEFAULT_USAGE="Triggers LLM when critical messages arrive."
+    CAPABILITIES=["monitoring", "critical_events", "llm_trigger"]
     def __init__(self, llm_trigger_url: str, cooldown_s: float = 10.0):
         super().__init__(
             name="critical_monitor",
@@ -17,7 +23,9 @@ class CriticalMonitorAgent(DynamicAgent):
         self._last_trigger_ts = 0.0
 
     def _is_critical(self, content: str) -> bool:
-        text = (content or "").lower()
+        print(content)
+        text = (content['details'] or "").lower()
+        
         # adjust this to your real signal
         return ("critical" in text) or ("panic" in text) or ("incident" in text)
 

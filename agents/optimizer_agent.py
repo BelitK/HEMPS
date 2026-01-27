@@ -1,7 +1,7 @@
 from typing import Any, Dict, List
 
-from dynamic_agent import DynamicAgent
-from message import Message, MessageLevel
+from .dynamic_agent import DynamicAgent
+from .message import Message, MessageLevel
 from pulp import (
     LpMinimize,
     LpProblem,
