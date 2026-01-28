@@ -521,14 +521,14 @@ async def send_message_to_io_agent(req: dict):
 
 class SendMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    agent_name: AgentName
+    target_name: AgentName
     content: str
     meta: str
 
 
 @app.post("/send_message")
 async def send_message_to_agent(req: SendMessageRequest):
-    agent_name = req.agent_name
+    agent_name = req.target_name
     content = req.content
     meta = req.meta
 
@@ -537,7 +537,7 @@ async def send_message_to_agent(req: SendMessageRequest):
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
 
     await agents_by_name.get("io_agent").send_message(content=content, meta=meta, receiver_addr=agent.addr)
-    return {"status": f"message sent to agent '{agent_name}'"}
+    return {"status": f"message sent successfully to agent '{agent_name}'"}
 
 @app.get('/trigger_emergency')
 async def trigger_emergency():
