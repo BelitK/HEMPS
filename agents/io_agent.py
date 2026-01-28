@@ -126,7 +126,7 @@ class IOAgent(DynamicAgent):
         - From Dispatcher: Route commands to appropriate agents
         - From Device Agents: Update their registered info
         """
-        sender = sender_addr(meta)
+        sender = sender_addr(meta) or None
         print(f"[{self.name}] Received from {sender}: {content}")
         
         # If content is a dict with 'type' field, handle accordingly

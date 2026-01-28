@@ -194,7 +194,7 @@ PLANNER_INSTRUCTIONS = (
 )
 
 llm = ChatOllama(
-    model="mistral:7b"
+    model="qwen3:14b",
     #model="gpt-oss:20b",
     #base_url="http://minsky.informatik.uni-oldenburg.de:26129",
     temperature=0.15,

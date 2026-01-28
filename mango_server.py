@@ -516,27 +516,27 @@ async def send_message_to_io_agent(req: dict):
         raise HTTPException(status_code=500, detail="IOAgent 'io_agent' not found")
 
     # Forward the message to the IO agent
-    io_agent.handle_message(content=req["content"], meta=req["meta"])
+    await container.send_message(content=req["content"], meta=req["meta"], receiver_addr=io_agent.addr)
     return {"status": "message sent to IO agent"}
 
 class SendMessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     agent_name: AgentName
-    content: AgentName
+    content: str
     meta: str
 
 
 @app.post("/send_message")
 async def send_message_to_agent(req: SendMessageRequest):
-    agent_name = req.get("agent_name")
-    content = req.get("content")
-    meta = req.get("meta")
+    agent_name = req.agent_name
+    content = req.content
+    meta = req.meta
 
     agent = agents_by_name.get(agent_name)
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
 
-    agent.handle_message(content=content, meta=meta)
+    await agents_by_name.get("io_agent").send_message(content=content, meta=meta, receiver_addr=agent.addr)
     return {"status": f"message sent to agent '{agent_name}'"}
 
 @app.get('/trigger_emergency')
