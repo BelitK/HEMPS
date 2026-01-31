@@ -23,12 +23,12 @@ wait_for_http() {
   local url="$1"
   local name="$2"
   echo "Waiting for ${name} to become available..."
-  for i in {1..60}; do
+  for i in {1..120}; do
     if curl -fsS "$url" >/dev/null 2>&1; then
       echo "✔ ${name} is up."
       return 0
     fi
-    sleep 0.5
+    sleep 1
   done
   echo "✖ ${name} did not start in time."
   exit 1
