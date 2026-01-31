@@ -37,11 +37,13 @@ class OptimizerAgent(DynamicAgent):
         name: str = "optimizer_agent",
         persona: str | None = None,
         usage: str | None = None,
+        Scheduler: Any = None,
     ):
         super().__init__(
             name=name,
             persona=persona or self.DEFAULT_PERSONA,
             usage=usage or self.DEFAULT_USAGE,
+            Scheduler=Scheduler,
         )
 
     # ------------------------
@@ -134,15 +136,17 @@ class OptimizerAgent(DynamicAgent):
     # ------------------------
 
     def handle_message(self, content, meta):
-        if not isinstance(content, Message):
-            return super().handle_message(content, meta)
+        # fix this
+        schedule_sche = self.scheduler.list(status=None)
+        # if not isinstance(content, Message):
+        #     return super().handle_message(content, meta)
 
-        # Only react to optimization requests
-        if content.level != MessageLevel.REQUEST:
-            return
+        # # Only react to optimization requests
+        # if content.level != MessageLevel.REQUEST:
+        #     return
 
         try:
-            result = self.optimize(content.payload)
+            result = self.optimize(schedule_sche)
 
             reply = Message(
                 level=MessageLevel.REPLY,

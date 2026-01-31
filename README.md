@@ -1,6 +1,6 @@
 # Usage
 
-The project description and a brief template documentation can be found in PROJECT.md. In this project, we provide a skeleton, which you can install and run as follows. Further, there are some examples of usage in src/template.py.
+Currently its using minsky cluster
 
 ## Installing
 ```bash
@@ -11,8 +11,5 @@ bash setup.sh
 ```bash
 bash run.sh
 
-## Run streamlit app 
-''' bash
-streamlit run ui.py
-
-## Dont forget to activate .venv
+## UI (streamlit)
+localhost:8501

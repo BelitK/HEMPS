@@ -20,7 +20,7 @@ from mango import Agent, create_topology, activate, create_tcp_container
 
 from agents.CriticalMonitorAgent import CriticalMonitorAgent
 from agents.dynamic_agent import DynamicAgent
-from agents.test_agent import Router_Agent
+from agents.router_agent import Router_Agent
 from agents.io_agent import IOAgent
 from agents.agent_catalog import generate_agent_catalog
 from agents.message import Message, MessageLevel
@@ -339,6 +339,11 @@ async def shutdown():
 # -------------------------
 # Routes
 # -------------------------
+
+@app.get("/")
+async def root():
+    return {"Made By":"B2K"}
+
 @app.get("/agent_catalog")
 async def agent_catalog():
     # Return the generated catalog but only include types that the server supports
